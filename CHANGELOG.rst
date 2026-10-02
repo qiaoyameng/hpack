@@ -1,6 +1,13 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added ``Encoder.encode(..., shortest=True)`` and ``SHORTEST_HEADER_BLOCK_LIMIT`` for exhaustive, globally shortest encoding of header blocks with at most 10 fields.
+
 4.2.0 (2026-06-22)
 ------------------
 

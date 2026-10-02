@@ -33,6 +33,12 @@ _PREFIX_BIT_MAX_NUMBERS = [(2 ** i) - 1 for i in range(9)]
 # lot of headers, but if applications want to raise it they can do.
 DEFAULT_MAX_HEADER_LIST_SIZE = 2 ** 16
 
+SHORTEST_HEADER_BLOCK_LIMIT = 10
+
+PreparedHeader = tuple[bytes, bytes, bool]
+DynamicTableState = tuple[tuple[tuple[bytes, bytes], ...], int]
+ShortestState = dict[DynamicTableState, tuple[int, tuple[bytes, ...]]]
+
 
 def _unicode_if_needed(header: HeaderWeaklyTyped, raw: bool) -> HeaderTuple:
     """
@@ -159,6 +165,52 @@ def _to_bytes(value: bytes | str | Any) -> bytes:
     return value.encode("utf-8")  # type: ignore
 
 
+def _huffman_options(use_huffman: bool) -> tuple[bool, ...]:
+    return (True, False) if use_huffman else (False,)
+
+
+def _prepare_headers(
+    headers: Iterable[
+        HeaderTuple
+        | tuple[bytes | str, bytes | str]
+        | tuple[bytes | str, bytes | str, bool | None]
+    ]
+    | dict[bytes | str, bytes | str],
+) -> Iterable[PreparedHeader]:
+    if isinstance(headers, dict):
+        return (
+            (_to_bytes(name), _to_bytes(value), False)
+            for name, value in _dict_to_iterable(headers)
+        )
+
+    def prepared_headers() -> Iterable[PreparedHeader]:
+        for header in headers:
+            sensitive = isinstance(header, NeverIndexedHeaderTuple)
+            if not isinstance(header, HeaderTuple) and len(header) > 2:
+                sensitive = bool(header[2])
+            yield _to_bytes(header[0]), _to_bytes(header[1]), sensitive
+
+    return prepared_headers()
+
+
+def _prepare_shortest_headers(
+    headers: Iterable[
+        HeaderTuple
+        | tuple[bytes | str, bytes | str]
+        | tuple[bytes | str, bytes | str, bool | None]
+    ]
+    | dict[bytes | str, bytes | str],
+) -> list[PreparedHeader]:
+    prepared = list(_prepare_headers(headers))
+    if len(prepared) > SHORTEST_HEADER_BLOCK_LIMIT:
+        msg = (
+            "shortest encoding is limited to "
+            f"{SHORTEST_HEADER_BLOCK_LIMIT} headers; got {len(prepared)}"
+        )
+        raise ValueError(msg)
+    return prepared
+
+
 class Encoder:
     """
     An HPACK encoder object. This object takes HTTP headers and emits encoded
@@ -191,7 +243,9 @@ class Encoder:
                    tuple[bytes | str, bytes | str] | \
                    tuple[bytes | str, bytes | str, bool | None]] | \
                    dict[bytes | str, bytes | str],
-               huffman: bool = True) -> bytes:
+               huffman: bool = True,
+               *,
+               shortest: bool = False) -> bytes:
         """
         Takes a set of headers and encodes them into a HPACK-encoded header
         block.
@@ -232,15 +286,21 @@ class Encoder:
         :param huffman: (optional) Whether to Huffman-encode any header sent as
                         a literal value. Except for use when debugging, it is
                         recommended that this be left enabled.
+        :param shortest: (optional) Jointly search every legal representation
+                         for a small header block. This is limited to
+                         ``SHORTEST_HEADER_BLOCK_LIMIT`` (10) headers and
+                         chooses the indexed representation, whether an
+                         indexable literal is added to the dynamic table, and
+                         whether each literal name and value uses Huffman
+                         coding independently. The ``huffman`` argument is
+                         ignored in this mode. Raises ``ValueError`` for more
+                         than 10 headers.
 
         :returns: A bytestring containing the HPACK-encoded header block.
         """
-        # Transforming the headers into a header block is a procedure that can
-        # be modeled as a chain or pipe. First, the headers are encoded. This
-        # encoding can be done a number of ways. If the header name-value pair
-        # are already in the header table we can represent them using the
-        # indexed representation: the same is true if they are in the static
-        # table. Otherwise, a literal representation will be used.
+        if shortest:
+            return self._encode_shortest(headers)
+
         header_block = []
 
         # Before we begin, if the header table size has been changed we need
@@ -249,50 +309,241 @@ class Encoder:
             header_block.append(self._encode_table_size_change())
             self.header_table.resized = False
 
-        if isinstance(headers, dict):
-            # Turn the headers into a list of tuples if possible. This is the
-            # natural way to interact with them in HPACK. Because dictionaries are
-            # un-ordered, we need to make sure we grab the "special" headers first.
-            hpack_headers = _dict_to_iterable(headers)
-        else:
-            """
-            Assume headers is an iterable of HeaderTuples, or plain 2-tuples, or plain 3-tuples:
-
-            examples:
-            [
-                HeaderTuple(':method', 'GET'),
-                NeverIndexedHeaderTuple('customkey', 'sensitiveinfo'),
-            ]
-            or
-            [
-                (':method', 'GET'),
-                ('customkey', 'some-data'),
-            ]
-            or
-            [
-                (':method', 'GET', True),
-                ('customkey', 'sensitiveinfo', True),
-            ]
-            """
-            hpack_headers = iter(headers)  # type: ignore
+        hpack_headers = _prepare_headers(headers)
 
         # Add each header to the header block
-        for header in hpack_headers:
-            sensitive = False
-            if isinstance(header, HeaderTuple):
-                # HeaderTuple implies it's a 2-tuple with the sensitive information stored as instance attribute
-                sensitive = not header.indexable
-            elif len(header) > 2:
-                sensitive = header[2]
-
-            new_header = (_to_bytes(header[0]), _to_bytes(header[1]))
-            header_block.append(self.add(new_header, sensitive, huffman))
+        for name, value, sensitive in hpack_headers:
+            header_block.append(self.add((name, value), sensitive, huffman))
 
         encoded = b"".join(header_block)
 
         log.debug("Encoded header block to %s", encoded)
 
         return encoded
+
+    def _encode_shortest(
+        self,
+        headers: Iterable[
+            HeaderTuple
+            | tuple[bytes | str, bytes | str]
+            | tuple[bytes | str, bytes | str, bool | None]
+        ]
+        | dict[bytes | str, bytes | str],
+    ) -> bytes:
+        prepared = _prepare_shortest_headers(headers)
+
+        size_change = b""
+        if self.header_table.resized:
+            size_change = self._encode_table_size_change()
+
+        dynamic_entries = self._visible_table_entries()
+        states: ShortestState = {
+            (dynamic_entries, self._visible_table_size(dynamic_entries)): (len(size_change), ()),
+        }
+
+        for name, value, sensitive in prepared:
+            states = self._shortest_header_states(states, name, value, sensitive)
+
+        best_state = min(states, key=lambda state: states[state][0])
+        best_cost, best_plan = states[best_state]
+        encoded = size_change + b"".join(best_plan)
+
+        if best_state[0] != dynamic_entries:
+            self.header_table.dynamic_entries.clear()
+            self.header_table.dynamic_entries.extend(best_state[0])
+        self.header_table._current_size = best_state[1]
+
+        log.debug("Encoded shortest header block (%d bytes) to %s", best_cost, encoded)
+        return encoded
+
+    def _shortest_header_states(
+        self,
+        states: ShortestState,
+        name: bytes,
+        value: bytes,
+        sensitive: bool,
+    ) -> ShortestState:
+        next_states: ShortestState = {}
+
+        for (entries, current_size), (cost, plan) in states.items():
+            exact_index = self._best_exact_index(name, value, entries)
+            name_index = self._best_name_index(name, entries)
+            candidates: list[tuple[bytes, bool]]
+
+            if sensitive:
+                if name_index is not None:
+                    candidates = [
+                        (self._shortest_never_indexed(name_index, value), False),
+                    ]
+                else:
+                    candidates = [
+                        (fragment, False)
+                        for fragment in self._shortest_literal_fragments(
+                            name, value, INDEX_NEVER,
+                        )
+                    ]
+            elif exact_index is not None:
+                candidates = [(self._encode_indexed(exact_index), False)]
+                duplicate = self._shortest_incremental_literal(name_index, name, value)
+                if duplicate is not None:
+                    candidates.append((duplicate, True))
+            else:
+                candidates = [
+                    (fragment, False)
+                    for fragment in self._shortest_no_index_fragments(name_index, name, value)
+                ]
+                incremental = self._shortest_incremental_literal(name_index, name, value)
+                if incremental is not None:
+                    candidates.append((incremental, True))
+
+            for fragment, add_to_table in candidates:
+                next_state = (entries, current_size)
+                if add_to_table:
+                    next_state = self._advance_table_state(entries, current_size, name, value)
+
+                next_cost = cost + len(fragment)
+                next_plan = plan + (fragment,)
+                current_best = next_states.get(next_state)
+                if current_best is None or next_cost < current_best[0] or (
+                    next_cost == current_best[0] and next_plan < current_best[1]
+                ):
+                    next_states[next_state] = (next_cost, next_plan)
+
+        return next_states
+
+    def _best_exact_index(
+        self,
+        name: bytes,
+        value: bytes,
+        entries: tuple[tuple[bytes, bytes], ...],
+    ) -> int | None:
+        static_match = HeaderTable.STATIC_TABLE_MAPPING.get(name)
+        best_index = static_match[1].get(value) if static_match is not None else None
+        dynamic_offset = HeaderTable.STATIC_TABLE_LENGTH + 1
+        for i, (entry_name, entry_value) in enumerate(entries):
+            if entry_name == name and entry_value == value:
+                index = i + dynamic_offset
+                if best_index is None or index < best_index:
+                    best_index = index
+        return best_index
+
+    def _shortest_literal_fragments(
+        self,
+        name: bytes,
+        value: bytes,
+        index_bit: bytes,
+    ) -> list[bytes]:
+        name_huffman = self._shortest_string_choice(name)
+        value_huffman = self._shortest_string_choice(value)
+        return [
+            self._encode_literal(
+                name,
+                value,
+                index_bit,
+                huffman=False,
+                name_huffman=use_name_huffman,
+                value_huffman=use_value_huffman,
+            )
+            for use_name_huffman in _huffman_options(name_huffman)
+            for use_value_huffman in _huffman_options(value_huffman)
+        ]
+
+    def _shortest_indexed_literal_fragments(
+        self,
+        index: int | None,
+        name: bytes,
+        value: bytes,
+        index_bit: bytes,
+    ) -> list[bytes]:
+        if index is not None:
+            value_huffman = self._shortest_string_choice(value)
+            return [
+                self._encode_indexed_literal(
+                    index,
+                    value,
+                    index_bit,
+                    huffman=False,
+                    value_huffman=use_value_huffman,
+                )
+                for use_value_huffman in _huffman_options(value_huffman)
+            ]
+
+        return self._shortest_literal_fragments(name, value, index_bit)
+
+    def _shortest_no_index_fragments(
+        self,
+        index: int | None,
+        name: bytes,
+        value: bytes,
+    ) -> list[bytes]:
+        return self._shortest_indexed_literal_fragments(index, name, value, INDEX_NONE)
+
+    def _shortest_never_indexed(
+        self,
+        index: int,
+        value: bytes,
+    ) -> bytes:
+        return self._shortest_indexed_literal_fragments(index, b"", value, INDEX_NEVER)[0]
+
+    def _shortest_incremental_literal(
+        self,
+        index: int | None,
+        name: bytes,
+        value: bytes,
+    ) -> bytes | None:
+        if table_entry_size(name, value) > self.header_table.maxsize:
+            return None
+
+        fragments = self._shortest_indexed_literal_fragments(index, name, value, INDEX_INCREMENTAL)
+        return min(fragments, key=len) if fragments else None
+
+    def _best_name_index(
+        self, name: bytes, entries: tuple[tuple[bytes, bytes], ...],
+    ) -> int | None:
+        static_match = HeaderTable.STATIC_TABLE_MAPPING.get(name)
+        best_index = static_match[0] if static_match is not None else None
+        dynamic_offset = HeaderTable.STATIC_TABLE_LENGTH + 1
+        for i, (entry_name, _) in enumerate(entries):
+            if entry_name == name:
+                index = i + dynamic_offset
+                if best_index is None or index < best_index:
+                    best_index = index
+        return best_index
+
+    def _shortest_string_choice(self, value: bytes) -> bool:
+        encoded = self.huffman_coder.encode(value)
+        return len(encoded) < len(value)
+
+    def _advance_table_state(
+        self,
+        entries: tuple[tuple[bytes, bytes], ...],
+        current_size: int,
+        name: bytes,
+        value: bytes,
+    ) -> DynamicTableState:
+        entry_size = table_entry_size(name, value)
+        maxsize = self.header_table.maxsize
+        if entry_size > maxsize:
+            return (), 0
+
+        next_entries = ((name, value),) + entries
+        next_size = current_size + entry_size
+        while next_size > maxsize:
+            evicted_name, evicted_value = next_entries[-1]
+            next_entries = next_entries[:-1]
+            next_size -= table_entry_size(evicted_name, evicted_value)
+        return next_entries, next_size
+
+    def _visible_table_entries(self) -> tuple[tuple[bytes, bytes], ...]:
+        maxsize = self.header_table.maxsize
+        entries = list(self.header_table.dynamic_entries)
+        current_size = self.header_table._current_size
+        while current_size > maxsize and entries:
+            current_size -= table_entry_size(*entries.pop())
+        return tuple(entries)
+
+    def _visible_table_size(self, entries: tuple[tuple[bytes, bytes], ...]) -> int:
+        return sum(table_entry_size(name, value) for name, value in entries)
 
     def add(self, to_add: tuple[bytes, bytes], sensitive: bool, huffman: bool = False) -> bytes:
         """
@@ -358,28 +609,55 @@ class Encoder:
         field[0] |= 0x80  # we set the top bit
         return bytes(field)
 
-    def _encode_literal(self, name: bytes, value: bytes, indexbit: bytes, huffman: bool = False) -> bytes:
+    def _encode_literal(
+        self,
+        name: bytes,
+        value: bytes,
+        indexbit: bytes,
+        huffman: bool = False,
+        *,
+        name_huffman: bool | None = None,
+        value_huffman: bool | None = None,
+    ) -> bytes:
         """
         Encodes a header with a literal name and literal value. If ``indexing``
         is True, the header will be added to the header table: otherwise it
         will not.
         """
-        if huffman:
+        if name_huffman is None:
+            name_huffman = huffman
+        if value_huffman is None:
+            value_huffman = huffman
+        if name_huffman:
             name = self.huffman_coder.encode(name)
+        if value_huffman:
             value = self.huffman_coder.encode(value)
 
         name_len = encode_integer(len(name), 7)
         value_len = encode_integer(len(value), 7)
 
-        if huffman:
+        if name_huffman:
             name_len[0] |= 0x80
+        else:
+            name_len[0] &= 0x7F
+        if value_huffman:
             value_len[0] |= 0x80
+        else:
+            value_len[0] &= 0x7F
 
         return b"".join(
             [indexbit, bytes(name_len), name, bytes(value_len), value],
         )
 
-    def _encode_indexed_literal(self, index: int, value: bytes, indexbit: bytes, huffman: bool = False) -> bytes:
+    def _encode_indexed_literal(
+        self,
+        index: int,
+        value: bytes,
+        indexbit: bytes,
+        huffman: bool = False,
+        *,
+        value_huffman: bool | None = None,
+    ) -> bytes:
         """
         Encodes a header with an indexed name and a literal value and performs
         incremental indexing.
@@ -391,13 +669,17 @@ class Encoder:
 
         prefix[0] |= ord(indexbit)
 
-        if huffman:
+        if value_huffman is None:
+            value_huffman = huffman
+        if value_huffman:
             value = self.huffman_coder.encode(value)
 
         value_len = encode_integer(len(value), 7)
 
-        if huffman:
+        if value_huffman:
             value_len[0] |= 0x80
+        else:
+            value_len[0] &= 0x7F
 
         return b"".join([bytes(prefix), bytes(value_len), value])
 
@@ -630,7 +912,8 @@ class Decoder:
             # move forward.
             data = data[1:]
 
-            length, consumed = decode_integer(data, 7)
+            length_data = bytes([data[0] & 0x7F]) + data[1:]
+            length, consumed = decode_integer(length_data, 7)
             name = data[consumed:consumed + length]
             if len(name) != length:
                 msg = "Truncated header block"
@@ -643,7 +926,8 @@ class Decoder:
         data = data[consumed + length:]
 
         # The header value is definitely length-based.
-        length, consumed = decode_integer(data, 7)
+        length_data = bytes([data[0] & 0x7F]) + data[1:]
+        length, consumed = decode_integer(length_data, 7)
         value = data[consumed:consumed + length]
         if len(value) != length:
             msg = "Truncated header block"
