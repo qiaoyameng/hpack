@@ -9,6 +9,30 @@ This document provides the HPACK API.
 .. autoclass:: hpack.Decoder
    :members: header_table_size, decode
 
+.. autoclass:: hpack.DecodeTrace
+
+.. autoclass:: hpack.RepresentationTrace
+
+.. autoclass:: hpack.DynamicTableReference
+
+.. autoclass:: hpack.DynamicEntryOrigin
+
+.. autoclass:: hpack.ByteRange
+
+.. autoclass:: hpack.RepresentationType
+   :members:
+   :undoc-members:
+
+.. autoclass:: hpack.TableSizeChange
+
+.. autoclass:: hpack.EntryEviction
+
+.. autoclass:: hpack.TableCleared
+
+.. autoclass:: hpack.TableEventType
+   :members:
+   :undoc-members:
+
 .. autoclass:: hpack.HeaderTuple
    :members: indexable
 

@@ -1,9 +1,13 @@
 # flake8: noqa
+from __future__ import annotations
+
 from collections import deque
+from dataclasses import dataclass
 import logging
 from typing import Optional
 
 from .exceptions import InvalidTableIndex
+from .trace import DynamicEntryOrigin, TableClearReason
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +25,50 @@ def table_entry_size(name: bytes, value: bytes) -> int:
     See RFC7541 Section 4.1
     """
     return 32 + len(name) + len(value)
+
+
+class DynamicTableEntry(tuple[bytes, bytes]):
+    """A dynamic table entry with optional creation provenance."""
+
+    def __new__(
+        cls,
+        name: bytes,
+        value: bytes,
+        origin: DynamicEntryOrigin | None = None,
+    ) -> DynamicTableEntry:
+        entry = tuple.__new__(cls, (name, value))
+        entry.origin = origin
+        return entry
+
+
+@dataclass(frozen=True)
+class RemovedDynamicEntry:
+    """An entry removed from the dynamic table."""
+
+    index: int
+    entry_size: int
+    origin: DynamicEntryOrigin | None
+
+
+@dataclass(frozen=True)
+class DynamicTableMutation:
+    """Structural changes made by one table operation."""
+
+    inserted_index: int | None = None
+    evicted_entries: tuple[RemovedDynamicEntry, ...] = ()
+    cleared: bool = False
+    clear_reason: TableClearReason | None = None
+    old_size: int = 0
+    new_size: int = 0
+
+
+@dataclass(frozen=True)
+class DynamicTableResize:
+    """Result of changing the dynamic table maximum size."""
+
+    old_max_size: int
+    new_max_size: int
+    mutation: DynamicTableMutation
 
 
 class HeaderTable:
@@ -111,7 +159,17 @@ class HeaderTable:
         self._maxsize = HeaderTable.DEFAULT_SIZE
         self._current_size = 0
         self.resized = False
-        self.dynamic_entries: deque[tuple[bytes, bytes]] = deque()
+        self.block_sequence = 0
+        self.dynamic_entries: deque[DynamicTableEntry] = deque()
+
+    def advance_block_sequence(self) -> int:
+        """
+        Marks the start of another decoded header block and returns its
+        zero-based sequence number.
+        """
+        block_sequence = self.block_sequence
+        self.block_sequence += 1
+        return block_sequence
 
     def get_by_index(self, index: int) -> tuple[bytes, bytes]:
         """
@@ -144,7 +202,33 @@ class HeaderTable:
             self.dynamic_entries
         )
 
-    def add(self, name: bytes, value: bytes) -> None:
+    def get_entry_by_index(
+        self,
+        index: int,
+    ) -> tuple[bytes, bytes, DynamicEntryOrigin | None]:
+        """
+        Returns the name, value, and optional origin of the specified entry.
+        """
+        original_index = index
+        index -= 1
+        if 0 <= index:
+            if index < HeaderTable.STATIC_TABLE_LENGTH:
+                name, value = HeaderTable.STATIC_TABLE[index]
+                return name, value, None
+
+            index -= HeaderTable.STATIC_TABLE_LENGTH
+            if index < len(self.dynamic_entries):
+                entry = self.dynamic_entries[index]
+                return entry[0], entry[1], entry.origin
+
+        raise InvalidTableIndex("Invalid table index %d" % original_index)
+
+    def add(
+        self,
+        name: bytes,
+        value: bytes,
+        origin: DynamicEntryOrigin | None = None,
+    ) -> DynamicTableMutation:
         """
         Adds a new entry to the table
 
@@ -154,13 +238,29 @@ class HeaderTable:
         # We just clear the table if the entry is too big
         size = table_entry_size(name, value)
         if size > self._maxsize:
+            removed = self._clear(TableClearReason.ENTRY_TOO_LARGE)
             self.dynamic_entries.clear()
             self._current_size = 0
+            return DynamicTableMutation(
+                inserted_index=None,
+                cleared=True,
+                clear_reason=TableClearReason.ENTRY_TOO_LARGE,
+                evicted_entries=removed.evicted_entries,
+                old_size=removed.old_size,
+                new_size=0,
+            )
         else:
             # Add new entry
-            self.dynamic_entries.appendleft((name, value))
+            old_size = self._current_size
+            self.dynamic_entries.appendleft(DynamicTableEntry(name, value, origin))
             self._current_size += size
-            self._shrink()
+            evicted_entries = self._shrink()
+            return DynamicTableMutation(
+                inserted_index=HeaderTable.STATIC_TABLE_LENGTH + 1,
+                evicted_entries=tuple(evicted_entries),
+                old_size=old_size,
+                new_size=self._current_size,
+            )
 
     def search(self, name: bytes, value: bytes) -> Optional[tuple[int, bytes, Optional[bytes]]]:
         """
@@ -197,27 +297,81 @@ class HeaderTable:
 
     @maxsize.setter
     def maxsize(self, newmax: int) -> None:
+        self.resize(newmax)
+
+    def resize(self, newmax: int) -> DynamicTableResize:
+        """
+        Changes the maximum dynamic table size and reports structural changes.
+        """
         newmax = int(newmax)
         log.debug("Resizing header table to %d from %d", newmax, self._maxsize)
         oldmax = self._maxsize
+        old_size = self._current_size
         self._maxsize = newmax
         self.resized = (newmax != oldmax)
+        mutation: DynamicTableMutation
         if newmax <= 0:
+            removed = self._clear(TableClearReason.TABLE_SIZE_UPDATE)
             self.dynamic_entries.clear()
             self._current_size = 0
+            mutation = DynamicTableMutation(
+                cleared=True,
+                clear_reason=TableClearReason.TABLE_SIZE_UPDATE,
+                evicted_entries=removed.evicted_entries,
+                old_size=old_size,
+                new_size=0,
+            )
         elif oldmax > newmax:
-            self._shrink()
+            evicted_entries = self._shrink()
+            mutation = DynamicTableMutation(
+                evicted_entries=tuple(evicted_entries),
+                old_size=old_size,
+                new_size=self._current_size,
+            )
+        else:
+            mutation = DynamicTableMutation(old_size=old_size, new_size=old_size)
+        return DynamicTableResize(oldmax, newmax, mutation)
 
-    def _shrink(self) -> None:
+    def _clear(self, reason: TableClearReason) -> DynamicTableMutation:
+        removed_entries = []
+        for position in range(len(self.dynamic_entries), 0, -1):
+            entry = self.dynamic_entries[position - 1]
+            name, value = entry
+            removed_entries.append(
+                RemovedDynamicEntry(
+                    index=HeaderTable.STATIC_TABLE_LENGTH + position,
+                    entry_size=table_entry_size(name, value),
+                    origin=getattr(entry, "origin", None),
+                ),
+            )
+        return DynamicTableMutation(
+            cleared=True,
+            clear_reason=reason,
+            evicted_entries=tuple(removed_entries),
+            old_size=self._current_size,
+            new_size=0,
+        )
+
+    def _shrink(
+        self,
+    ) -> list[RemovedDynamicEntry]:
         """
         Shrinks the dynamic table to be at or below maxsize
         """
         cursize = self._current_size
+        removed_entries = []
         while cursize > self._maxsize:
-            name, value = self.dynamic_entries.pop()
-            cursize -= table_entry_size(name, value)
-            log.debug("Evicting %s: %s from the header table", name, value)
+            entry = self.dynamic_entries.pop()
+            name, value = entry
+            entry_size = table_entry_size(name, value)
+            index = HeaderTable.STATIC_TABLE_LENGTH + len(self.dynamic_entries) + 1
+            removed_entries.append(
+                RemovedDynamicEntry(index, entry_size, entry.origin),
+            )
+            cursize -= entry_size
+            log.debug("Evicting dynamic table entry at index %d", index)
         self._current_size = cursize
+        return removed_entries
 
 
 def _build_static_table_mapping() -> dict[bytes, tuple[int, dict[bytes, int]]]:

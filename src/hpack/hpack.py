@@ -4,6 +4,7 @@ Implements the HPACK header compression algorithm as detailed by RFC 7541.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .exceptions import HPACKDecodingError, InvalidTableSizeError, OversizedHeaderListError
@@ -11,7 +12,24 @@ from .huffman import HuffmanEncoder
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from .huffman_table import decode_huffman
 from .struct import HeaderTuple, HeaderWeaklyTyped, NeverIndexedHeaderTuple
-from .table import HeaderTable, table_entry_size
+from .table import (
+    DynamicTableMutation,
+    DynamicTableResize,
+    HeaderTable,
+    table_entry_size,
+)
+from .trace import (
+    ByteRange,
+    DecodeTrace,
+    DynamicEntryOrigin,
+    DynamicTableReference,
+    EntryEviction,
+    RepresentationTrace,
+    RepresentationType,
+    TableClearReason,
+    TableCleared,
+    TableSizeChange,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable  # pragma: no cover
@@ -32,6 +50,17 @@ _PREFIX_BIT_MAX_NUMBERS = [(2 ** i) - 1 for i in range(9)]
 # We default the maximum header list we're willing to accept to 64kB. That's a
 # lot of headers, but if applications want to raise it they can do.
 DEFAULT_MAX_HEADER_LIST_SIZE = 2 ** 16
+
+
+@dataclass(frozen=True)
+class _DecodedLiteral:
+    header: HeaderTuple
+    consumed: int
+    name_index: int | None
+    name_origin: DynamicEntryOrigin | None
+    name_huffman: bool
+    value_huffman: bool
+    never_indexed: bool
 
 
 def _unicode_if_needed(header: HeaderWeaklyTyped, raw: bool) -> HeaderTuple:
@@ -290,7 +319,7 @@ class Encoder:
 
         encoded = b"".join(header_block)
 
-        log.debug("Encoded header block to %s", encoded)
+        log.debug("Encoded header block (%d bytes)", len(encoded))
 
         return encoded
 
@@ -476,7 +505,84 @@ class Decoder:
     def header_table_size(self, value: int) -> None:
         self.header_table.maxsize = value
 
-    def decode(self, data: bytes, raw: bool = False) -> Iterable[HeaderTuple]:
+    @staticmethod
+    def _dynamic_reference(
+        index: int | None,
+        origin: DynamicEntryOrigin | None,
+        name_only: bool = False,
+    ) -> DynamicTableReference | None:
+        if index is None or origin is None:
+            return None
+        return DynamicTableReference(index=index, origin=origin, name_only=name_only)
+
+    def _record_table_mutation(
+        self,
+        trace: DecodeTrace | None,
+        mutation: DynamicTableMutation,
+        start: int,
+        end: int,
+    ) -> None:
+        if trace is None:
+            return
+
+        byte_range = ByteRange(start, end)
+        if mutation.cleared:
+            trace.add_table_event(
+                TableCleared(
+                    byte_range=byte_range,
+                    reason=mutation.clear_reason or TableClearReason.ENTRY_TOO_LARGE,
+                    entries=tuple(
+                        DynamicTableReference(index=removed.index, origin=removed.origin)
+                        for removed in mutation.evicted_entries
+                    ),
+                    old_size=mutation.old_size,
+                    new_size=mutation.new_size,
+                ),
+            )
+            return
+
+        for removed in mutation.evicted_entries:
+            trace.add_table_event(
+                EntryEviction(
+                    byte_range=byte_range,
+                    entry=DynamicTableReference(
+                        index=removed.index,
+                        origin=removed.origin,
+                    ),
+                    entry_size=removed.entry_size,
+                    new_size=mutation.new_size,
+                ),
+            )
+
+    def _record_table_resize(
+        self,
+        trace: DecodeTrace | None,
+        resize: DynamicTableResize,
+        start: int,
+        end: int,
+    ) -> None:
+        if trace is None:
+            return
+
+        byte_range = ByteRange(start, end)
+        mutation = resize.mutation
+        trace.add_table_event(
+            TableSizeChange(
+                byte_range=byte_range,
+                old_max_size=resize.old_max_size,
+                new_max_size=resize.new_max_size,
+                old_size=mutation.old_size,
+                new_size=mutation.new_size,
+            ),
+        )
+        self._record_table_mutation(trace, mutation, start, end)
+
+    def decode(
+        self,
+        data: bytes,
+        raw: bool = False,
+        trace: DecodeTrace | None = None,
+    ) -> Iterable[HeaderTuple]:
         """
         Takes an HPACK-encoded header block and decodes it into a header set.
 
@@ -486,78 +592,185 @@ class Decoder:
                     byte strings or to decode them as UTF-8 before returning
                     them. The default value is False, which returns tuples of
                     Unicode strings
+        :param trace: (optional) A :class:`DecodeTrace` object populated with
+                      structural decoding information. It never contains header
+                      names or values.
         :returns: A list of two-tuples of ``(name, value)`` representing the
                   HPACK-encoded headers, in the order they were decoded.
         :raises HPACKDecodingError: If an error is encountered while decoding
                                     the header block.
         """
-        log.debug("Decoding %s", data)
+        log.debug("Decoding header block (%d bytes)", len(data))
 
         data_mem = memoryview(data)
         headers: list[HeaderTuple] = []
         data_len = len(data)
         inflated_size = 0
         current_index = 0
+        header_sequence = 0
+        block_sequence = self.header_table.advance_block_sequence()
 
-        while current_index < data_len:
-            # Work out what kind of header we're decoding.
-            # If the high bit is 1, it's an indexed field.
-            current = data[current_index]
-            indexed = bool(current & 0x80)
+        if trace is not None:
+            trace.reset(block_sequence)
 
-            # Otherwise, if the second-highest bit is 1 it's a field that does
-            # alter the header table.
-            literal_index = bool(current & 0x40)
+        try:
+            while current_index < data_len:
+                representation_start = current_index
+                current = data[current_index]
+                indexed = bool(current & 0x80)
+                literal_index = bool(current & 0x40)
+                encoding_update = bool(current & 0x20)
+                representation: RepresentationTrace
+                header: HeaderTuple | None = None
 
-            # Otherwise, if the third-highest bit is 1 it's an encoding context
-            # update.
-            encoding_update = bool(current & 0x20)
+                if indexed:
+                    index, origin, header, consumed = self._decode_indexed(
+                        data_mem[current_index:],
+                        trace,
+                        current_index,
+                    )
+                    representation = RepresentationTrace(
+                        byte_range=ByteRange(
+                            representation_start,
+                            representation_start + consumed,
+                        ),
+                        representation_type=RepresentationType.INDEXED,
+                        index=index,
+                        entry_reference=self._dynamic_reference(index, origin),
+                    )
+                elif literal_index:
+                    literal, consumed = self._decode_literal_index(
+                        data_mem[current_index:],
+                        trace,
+                        current_index,
+                    )
+                    header = literal.header
+                    byte_range = ByteRange(
+                        representation_start,
+                        representation_start + consumed,
+                    )
+                    origin = DynamicEntryOrigin(
+                        block_sequence=block_sequence,
+                        header_sequence=header_sequence,
+                        byte_range=byte_range,
+                        representation_type=(
+                            RepresentationType.LITERAL_WITH_INCREMENTAL_INDEXING
+                        ),
+                    )
+                    mutation = self.header_table.add(header[0], header[1], origin)
+                    self._record_table_mutation(
+                        trace,
+                        mutation,
+                        representation_start,
+                        representation_start + consumed,
+                    )
+                    representation = RepresentationTrace(
+                        byte_range=byte_range,
+                        representation_type=(
+                            RepresentationType.LITERAL_WITH_INCREMENTAL_INDEXING
+                        ),
+                        huffman=literal.name_huffman or literal.value_huffman,
+                        name_huffman=literal.name_huffman,
+                        value_huffman=literal.value_huffman,
+                        index=literal.name_index,
+                        inserted_index=mutation.inserted_index,
+                        name_reference=self._dynamic_reference(
+                            literal.name_index,
+                            literal.name_origin,
+                            name_only=True,
+                        ),
+                    )
+                elif encoding_update:
+                    if headers:
+                        msg = "Table size update not at the start of the block"
+                        if trace is not None:
+                            trace.mark_error(current_index, current_index)
+                        raise HPACKDecodingError(msg)
+                    resize, consumed = self._update_encoding_context(
+                        data_mem[current_index:],
+                        trace,
+                        current_index,
+                    )
+                    self._record_table_resize(
+                        trace,
+                        resize,
+                        representation_start,
+                        representation_start + consumed,
+                    )
+                    representation = RepresentationTrace(
+                        byte_range=ByteRange(
+                            representation_start,
+                            representation_start + consumed,
+                        ),
+                        representation_type=RepresentationType.DYNAMIC_TABLE_SIZE_UPDATE,
+                    )
+                else:
+                    literal, consumed = self._decode_literal_no_index(
+                        data_mem[current_index:],
+                        trace,
+                        current_index,
+                    )
+                    header = literal.header
+                    representation = RepresentationTrace(
+                        byte_range=ByteRange(
+                            representation_start,
+                            representation_start + consumed,
+                        ),
+                        representation_type=(
+                            RepresentationType.LITERAL_NEVER_INDEXED
+                            if literal.never_indexed
+                            else RepresentationType.LITERAL_WITHOUT_INDEXING
+                        ),
+                        huffman=literal.name_huffman or literal.value_huffman,
+                        never_indexed=literal.never_indexed,
+                        name_huffman=literal.name_huffman,
+                        value_huffman=literal.value_huffman,
+                        index=literal.name_index,
+                        name_reference=self._dynamic_reference(
+                            literal.name_index,
+                            literal.name_origin,
+                            name_only=True,
+                        ),
+                    )
 
-            if indexed:
-                header, consumed = self._decode_indexed(
-                    data_mem[current_index:],
-                )
-            elif literal_index:
-                # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal_index(
-                    data_mem[current_index:],
-                )
-            elif encoding_update:
-                # It's an update to the encoding context. These are forbidden
-                # in a header block after any actual header.
-                if headers:
-                    msg = "Table size update not at the start of the block"
-                    raise HPACKDecodingError(msg)
-                consumed = self._update_encoding_context(
-                    data_mem[current_index:],
-                )
-                header = None
-            else:
-                # It's a literal header that does not affect the header table.
-                header, consumed = self._decode_literal_no_index(
-                    data_mem[current_index:],
-                )
+                if trace is not None:
+                    trace.add_representation(representation)
 
-            if header:
-                headers.append(header)
-                inflated_size += table_entry_size(header[0], header[1])
+                if header is not None:
+                    headers.append(header)
+                    inflated_size += table_entry_size(header[0], header[1])
+                    if inflated_size > self.max_header_list_size:
+                        msg = f"A header list larger than {self.max_header_list_size} has been received"
+                        if trace is not None:
+                            trace.mark_error(
+                                representation_start + consumed,
+                                representation_start,
+                            )
+                        raise OversizedHeaderListError(msg)
+                    header_sequence += 1
 
-                if inflated_size > self.max_header_list_size:
-                    msg = f"A header list larger than {self.max_header_list_size} has been received"
-                    raise OversizedHeaderListError(msg)
+                current_index += consumed
 
-            current_index += consumed
-
-        # Confirm that the table size is lower than the maximum. We do this
-        # here to ensure that we catch when the max has been *shrunk* and the
-        # remote peer hasn't actually done that.
-        self._assert_valid_table_size()
+            self._assert_valid_table_size()
+            if trace is not None:
+                trace.mark_complete()
+        except HPACKDecodingError as err:
+            if trace is not None:
+                trace.mark_error(current_index)
+                if err.trace is None:
+                    err.trace = trace
+            raise
 
         try:
             return [_unicode_if_needed(h, raw) for h in headers]
         except UnicodeDecodeError as err:
+            if trace is not None:
+                trace.mark_error(data_len)
             msg = "Unable to decode headers as UTF-8"
-            raise HPACKDecodingError(msg) from err
+            error = HPACKDecodingError(msg)
+            if trace is not None:
+                error.trace = trace
+            raise error from err
 
     def _assert_valid_table_size(self) -> None:
         """
@@ -568,34 +781,78 @@ class Decoder:
             msg = "Encoder did not shrink table size to within the max"
             raise InvalidTableSizeError(msg)
 
-    def _update_encoding_context(self, data: bytes | memoryview) -> int:
+    def _update_encoding_context(
+        self,
+        data: bytes | memoryview,
+        trace: DecodeTrace | None = None,
+        base_offset: int = 0,
+    ) -> tuple[DynamicTableResize, int]:
         """
         Handles a byte that updates the encoding context.
         """
         # We've been asked to resize the header table.
-        new_size, consumed = decode_integer(data, 5)
+        try:
+            new_size, consumed = decode_integer(data, 5)
+        except HPACKDecodingError:
+            if trace is not None:
+                trace.mark_error(base_offset, base_offset)
+            raise
         if new_size > self.max_allowed_table_size:
             msg = "Encoder exceeded max allowable table size"
+            if trace is not None:
+                trace.mark_error(base_offset + consumed, base_offset)
             raise InvalidTableSizeError(msg)
-        self.header_table_size = new_size
-        return consumed
+        resize = self.header_table.resize(new_size)
+        return resize, consumed
 
-    def _decode_indexed(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
+    def _decode_indexed(
+        self,
+        data: bytes | memoryview,
+        trace: DecodeTrace | None = None,
+        base_offset: int = 0,
+    ) -> tuple[int, DynamicEntryOrigin | None, HeaderTuple, int]:
         """
         Decodes a header represented using the indexed representation.
         """
-        index, consumed = decode_integer(data, 7)
-        header = HeaderTuple(*self.header_table.get_by_index(index))
-        log.debug("Decoded %s, consumed %d", header, consumed)
-        return header, consumed
+        try:
+            index, consumed = decode_integer(data, 7)
+        except HPACKDecodingError:
+            if trace is not None:
+                trace.mark_error(base_offset, base_offset)
+            raise
+        try:
+            name, value, origin = self.header_table.get_entry_by_index(index)
+        except HPACKDecodingError:
+            if trace is not None:
+                trace.mark_error(base_offset + consumed, base_offset)
+            raise
+        header = HeaderTuple(name, value)
+        log.debug("Decoded indexed representation, consumed %d bytes", consumed)
+        return index, origin, header, consumed
 
-    def _decode_literal_no_index(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
-        return self._decode_literal(data, should_index=False)
+    def _decode_literal_no_index(
+        self,
+        data: bytes | memoryview,
+        trace: DecodeTrace | None = None,
+        base_offset: int = 0,
+    ) -> tuple[_DecodedLiteral, int]:
+        return self._decode_literal(data, should_index=False, trace=trace, base_offset=base_offset)
 
-    def _decode_literal_index(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
-        return self._decode_literal(data, should_index=True)
+    def _decode_literal_index(
+        self,
+        data: bytes | memoryview,
+        trace: DecodeTrace | None = None,
+        base_offset: int = 0,
+    ) -> tuple[_DecodedLiteral, int]:
+        return self._decode_literal(data, should_index=True, trace=trace, base_offset=base_offset)
 
-    def _decode_literal(self, data: bytes | memoryview, should_index: bool) -> tuple[HeaderTuple, int]:
+    def _decode_literal(
+        self,
+        data: bytes | memoryview,
+        should_index: bool,
+        trace: DecodeTrace | None = None,
+        base_offset: int = 0,
+    ) -> tuple[_DecodedLiteral, int]:
         """
         Decodes a header represented with a literal.
         """
@@ -603,6 +860,10 @@ class Decoder:
             data = data.tobytes()  # pragma: no cover
 
         total_consumed = 0
+        name_index: int | None = None
+        name_origin: DynamicEntryOrigin | None = None
+        name_huffman = False
+        value_huffman = False
 
         # When should_index is true, if the low six bits of the first byte are
         # nonzero, the header name is indexed.
@@ -620,8 +881,19 @@ class Decoder:
 
         if indexed_name:
             # Indexed header name.
-            index, consumed = decode_integer(data, name_len)
-            name = self.header_table.get_by_index(index)[0]
+            try:
+                index, consumed = decode_integer(data, name_len)
+            except HPACKDecodingError:
+                if trace is not None:
+                    trace.mark_error(base_offset, base_offset)
+                raise
+            try:
+                name, _, name_origin = self.header_table.get_entry_by_index(index)
+            except HPACKDecodingError:
+                if trace is not None:
+                    trace.mark_error(base_offset + consumed, base_offset)
+                raise
+            name_index = index
 
             total_consumed = consumed
             length = 0
@@ -630,27 +902,59 @@ class Decoder:
             # move forward.
             data = data[1:]
 
-            length, consumed = decode_integer(data, 7)
+            try:
+                length, consumed = decode_integer(data, 7)
+            except HPACKDecodingError:
+                if trace is not None:
+                    trace.mark_error(base_offset + 1, base_offset)
+                raise
             name = data[consumed:consumed + length]
             if len(name) != length:
                 msg = "Truncated header block"
+                if trace is not None:
+                    trace.mark_error(
+                        base_offset + 1 + consumed + len(name),
+                        base_offset,
+                    )
                 raise HPACKDecodingError(msg)
 
             if data[0] & 0x80:
-                name = decode_huffman(name)
+                name_huffman = True
+                try:
+                    name = decode_huffman(name)
+                except HPACKDecodingError:
+                    if trace is not None:
+                        trace.mark_error(base_offset + total_consumed + consumed, base_offset)
+                    raise
             total_consumed = consumed + length + 1  # Since we moved forward 1.
 
         data = data[consumed + length:]
 
         # The header value is definitely length-based.
-        length, consumed = decode_integer(data, 7)
+        try:
+            length, consumed = decode_integer(data, 7)
+        except HPACKDecodingError:
+            if trace is not None:
+                trace.mark_error(base_offset + total_consumed, base_offset)
+            raise
         value = data[consumed:consumed + length]
         if len(value) != length:
             msg = "Truncated header block"
+            if trace is not None:
+                trace.mark_error(
+                    base_offset + total_consumed + consumed + len(value),
+                    base_offset,
+                )
             raise HPACKDecodingError(msg)
 
         if data[0] & 0x80:
-            value = decode_huffman(value)
+            value_huffman = True
+            try:
+                value = decode_huffman(value)
+            except HPACKDecodingError:
+                if trace is not None:
+                    trace.mark_error(base_offset + total_consumed + consumed, base_offset)
+                raise
 
         # Updated the total consumed length.
         total_consumed += length + consumed
@@ -663,15 +967,18 @@ class Decoder:
         else:
             header = HeaderTuple(name, value)
 
-        # If we've been asked to index this, add it to the header table.
-        if should_index:
-            self.header_table.add(name, value)
-
         log.debug(
-            "Decoded %s, total consumed %d bytes, indexed %s",
-            header,
+            "Decoded literal representation, consumed %d bytes, indexed %s",
             total_consumed,
             should_index,
         )
 
-        return header, total_consumed
+        return _DecodedLiteral(
+            header=header,
+            consumed=total_consumed,
+            name_index=name_index,
+            name_origin=name_origin,
+            name_huffman=name_huffman,
+            value_huffman=value_huffman,
+            never_indexed=not_indexable,
+        ), total_consumed

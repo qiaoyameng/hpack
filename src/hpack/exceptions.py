@@ -3,12 +3,22 @@ Exceptions used in hpack.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .trace import DecodeTrace
+
 
 class HPACKError(Exception):
     """
     The base class for all ``hpack`` exceptions.
     """
 
+    def __init__(self, *args: object, trace: DecodeTrace | None = None) -> None:
+        super().__init__(*args)
+        self.trace = trace
+
+    trace: DecodeTrace | None
 
 
 class HPACKDecodingError(HPACKError):
