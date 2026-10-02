@@ -162,6 +162,21 @@ class HeaderTable:
             self._current_size += size
             self._shrink()
 
+    def snapshot(self) -> tuple[deque[tuple[bytes, bytes]], int, bool]:
+        """
+        Captures the mutable state of the dynamic table so that it can be
+        restored later via ``restore``. This allows a partially-applied
+        sequence of changes (for example, a header block that failed to
+        encode) to be rolled back.
+        """
+        return (deque(self.dynamic_entries), self._current_size, self.resized)
+
+    def restore(self, snapshot: tuple[deque[tuple[bytes, bytes]], int, bool]) -> None:
+        """
+        Restores the dynamic table state previously captured by ``snapshot``.
+        """
+        self.dynamic_entries, self._current_size, self.resized = snapshot
+
     def search(self, name: bytes, value: bytes) -> Optional[tuple[int, bytes, Optional[bytes]]]:
         """
         Searches the table for the entry specified by name

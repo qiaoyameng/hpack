@@ -367,6 +367,80 @@ class TestHPACKEncoder:
         out = e.encode(header_set)
         assert Decoder().decode(out) == list(headers_generator())
 
+    def test_failed_encode_rolls_back_dynamic_table(self):
+        """
+        If the headers iterable raises partway through, the entries that were
+        tentatively added to the dynamic table must be rolled back: the peer
+        never received the block, so the encoder must not reference it.
+        """
+        e = Encoder()
+        d = Decoder()
+        first_block = e.encode([('x-a', '1')], huffman=False)
+        assert d.decode(first_block, raw=True) == [(b'x-a', b'1')]
+        entries_before = list(e.header_table.dynamic_entries)
+
+        def bad_headers():
+            yield ('x-b', '2')
+            raise RuntimeError("iteration failed")
+
+        with pytest.raises(RuntimeError, match="iteration failed"):
+            e.encode(bad_headers(), huffman=False)
+
+        assert list(e.header_table.dynamic_entries) == entries_before
+
+        # A fresh decoder that never saw the failed block must be able to
+        # decode the next block, and compression of earlier entries must
+        # still work.
+        out = e.encode([('x-a', '1')], huffman=False)
+        assert out == b'\xbe'  # indexed representation of the first entry
+        assert d.decode(out, raw=True) == [(b'x-a', b'1')]
+
+    def test_failed_encode_rolls_back_on_value_conversion_error(self):
+        """
+        A header value that cannot be converted to bytes must also leave the
+        encoder state untouched.
+        """
+        e = Encoder()
+        e.encode([('x-a', '1')], huffman=False)
+        entries_before = list(e.header_table.dynamic_entries)
+
+        class Unstringifiable:
+            def __str__(self):
+                raise ValueError("cannot stringify")
+
+        headers = [('x-b', '2'), ('x-c', Unstringifiable())]
+        with pytest.raises(ValueError, match="cannot stringify"):
+            e.encode(headers, huffman=False)
+
+        assert list(e.header_table.dynamic_entries) == entries_before
+
+    def test_failed_encode_preserves_pending_table_size_update(self):
+        """
+        A queued table size update must not be swallowed by a failed encode:
+        it has to be emitted at the start of the next successful block.
+        """
+        e = Encoder()
+        e.header_table_size = 128
+        assert e.header_table.resized
+
+        def bad_headers():
+            yield ('x-b', '2')
+            raise RuntimeError("iteration failed")
+
+        with pytest.raises(RuntimeError, match="iteration failed"):
+            e.encode(bad_headers(), huffman=False)
+
+        # The size update is still pending.
+        assert e.header_table.resized
+        assert e.table_size_changes == [128]
+
+        # The next block carries the size update, and a fresh decoder that
+        # never saw the failed block applies it.
+        out = e.encode([('x-c', '3')], huffman=False)
+        d = Decoder()
+        assert d.decode(out, raw=True) == [(b'x-c', b'3')]
+        assert d.header_table_size == 128
+
 
 class TestHPACKDecoder:
     # These tests are stolen entirely from the IETF specification examples.

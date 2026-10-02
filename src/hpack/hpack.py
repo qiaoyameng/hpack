@@ -3,6 +3,7 @@ Implements the HPACK header compression algorithm as detailed by RFC 7541.
 """
 from __future__ import annotations
 
+from collections import deque
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -234,7 +235,52 @@ class Encoder:
                         recommended that this be left enabled.
 
         :returns: A bytestring containing the HPACK-encoded header block.
+
+        .. note:: This method is exception-safe: if encoding fails partway
+                  through (for example because the ``headers`` iterable
+                  raises, or a header name/value cannot be converted to
+                  bytes), no header block is emitted and the encoder is
+                  restored to the exact state it had before the call. In
+                  particular, entries tentatively added to the dynamic table
+                  are rolled back and any pending table size updates remain
+                  queued for the next successful ``encode``. The original
+                  exception is re-raised unchanged.
         """
+        # Snapshot the peer-visible encoding state. If anything goes wrong
+        # while building this header block, the block is never sent to the
+        # peer, so the encoder must remain exactly as the decoder believes
+        # it to be. On failure we restore the snapshot and re-raise.
+        state_snapshot = self._snapshot_state()
+        succeeded = False
+        try:
+            encoded = self._encode(headers, huffman)
+            succeeded = True
+            return encoded
+        finally:
+            if not succeeded:
+                self._restore_state(state_snapshot)
+
+    def _snapshot_state(self) -> tuple[tuple[deque[tuple[bytes, bytes]], int, bool], list[int]]:
+        """
+        Captures the encoder state that is observable by the decoding peer,
+        so that a failed ``encode`` can be rolled back.
+        """
+        return (self.header_table.snapshot(), list(self.table_size_changes))
+
+    def _restore_state(self, snapshot: tuple[tuple[deque[tuple[bytes, bytes]], int, bool], list[int]]) -> None:
+        """
+        Restores the encoder state captured by ``_snapshot_state``.
+        """
+        table_snapshot, self.table_size_changes = snapshot
+        self.header_table.restore(table_snapshot)
+
+    def _encode(self,
+                headers: Iterable[\
+                    HeaderTuple | \
+                    tuple[bytes | str, bytes | str] | \
+                    tuple[bytes | str, bytes | str, bool | None]] | \
+                    dict[bytes | str, bytes | str],
+                huffman: bool = True) -> bytes:
         # Transforming the headers into a header block is a procedure that can
         # be modeled as a chain or pipe. First, the headers are encoded. This
         # encoding can be done a number of ways. If the header name-value pair
