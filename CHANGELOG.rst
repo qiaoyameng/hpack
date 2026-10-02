@@ -1,6 +1,20 @@
 Release History
 ===============
 
+dev
+---
+
+**API Changes (Backward Compatible)**
+
+- Added ``Encoder.encode_shortest``, an encoding mode explicitly limited to
+  small header blocks (at most ``hpack.SHORTEST_MAX_HEADERS``, i.e. 10,
+  header fields; larger blocks raise ``ValueError`` and should use
+  ``Encoder.encode``). It jointly optimizes the whole block -- indexed vs.
+  literal representations, whether non-sensitive literals are added to the
+  dynamic table, and independent Huffman choices for names and values --
+  without changing header order or sensitive markers, taking the current
+  dynamic table and pending table size updates into account.
+
 4.2.0 (2026-06-22)
 ------------------
 

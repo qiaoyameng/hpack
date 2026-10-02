@@ -3,6 +3,7 @@ Implements the HPACK header compression algorithm as detailed by RFC 7541.
 """
 from __future__ import annotations
 
+from collections import deque
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,15 @@ _PREFIX_BIT_MAX_NUMBERS = [(2 ** i) - 1 for i in range(9)]
 # We default the maximum header list we're willing to accept to 64kB. That's a
 # lot of headers, but if applications want to raise it they can do.
 DEFAULT_MAX_HEADER_LIST_SIZE = 2 ** 16
+
+# The maximum number of header fields accepted by ``Encoder.encode_shortest``.
+# The joint optimization it performs considers, for every field, every legal
+# representation (indexed / literal with or without incremental indexing /
+# never-indexed, indexed or literal name, Huffman on or off for the name and
+# the value independently) across the whole block, so its cost grows with the
+# number of fields. Blocks of at most this many fields are optimized exactly;
+# larger blocks must use ``Encoder.encode`` instead.
+SHORTEST_MAX_HEADERS = 10
 
 
 def _unicode_if_needed(header: HeaderWeaklyTyped, raw: bool) -> HeaderTuple:
@@ -157,6 +167,216 @@ def _to_bytes(value: bytes | str | Any) -> bytes:
     if t is not str:
         value = str(value)
     return value.encode("utf-8")  # type: ignore
+
+
+def _normalize_header_list(headers: Any) -> list[tuple[bytes, bytes, bool]]:
+    """
+    Normalizes the various accepted header inputs into a list of
+    ``(name, value, sensitive)`` triplets of bytes, preserving order.
+    """
+    if isinstance(headers, dict):
+        # Dictionaries are un-ordered, so make sure the "special" headers
+        # (those beginning with a colon) come first.
+        headers = _dict_to_iterable(headers)
+
+    normalized = []
+    for header in headers:
+        sensitive = False
+        if isinstance(header, HeaderTuple):
+            # HeaderTuple implies it's a 2-tuple with the sensitive
+            # information stored as an instance attribute.
+            sensitive = not header.indexable
+        elif len(header) > 2:
+            sensitive = bool(header[2])
+        normalized.append((_to_bytes(header[0]), _to_bytes(header[1]), sensitive))
+    return normalized
+
+
+def _encode_string(data: bytes, huffman: bool, huffman_coder: HuffmanEncoder) -> bytes:
+    """
+    Encodes a single string literal (length prefix plus data), optionally
+    Huffman-coded. Mirrors the string handling done by the ``Encoder``.
+    """
+    if huffman:
+        data = huffman_coder.encode(data)
+
+    length = encode_integer(len(data), 7)
+    if huffman:
+        length[0] |= 0x80
+
+    return bytes(length) + data
+
+
+def _render_indexed(index: int) -> bytes:
+    """
+    Renders the indexed header field representation for ``index``.
+    """
+    field = encode_integer(index, 7)
+    field[0] |= 0x80
+    return bytes(field)
+
+
+def _render_literal(name: bytes,
+                    value: bytes,
+                    indexbit: bytes,
+                    huffman_name: bool,
+                    huffman_value: bool,
+                    huffman_coder: HuffmanEncoder) -> bytes:
+    """
+    Renders a literal header field with a literal name, with independent
+    Huffman choices for the name and the value.
+    """
+    return b"".join([
+        indexbit,
+        _encode_string(name, huffman_name, huffman_coder),
+        _encode_string(value, huffman_value, huffman_coder),
+    ])
+
+
+def _render_indexed_name_literal(index: int,
+                                 value: bytes,
+                                 indexbit: bytes,
+                                 huffman_value: bool,
+                                 huffman_coder: HuffmanEncoder) -> bytes:
+    """
+    Renders a literal header field with an indexed name, choosing whether the
+    value is Huffman-coded.
+    """
+    if indexbit != INDEX_INCREMENTAL:
+        prefix = encode_integer(index, 4)
+    else:
+        prefix = encode_integer(index, 6)
+
+    prefix[0] |= ord(indexbit)
+
+    return b"".join([
+        bytes(prefix),
+        _encode_string(value, huffman_value, huffman_coder),
+    ])
+
+
+# A rendering decision for a single header field. Either ``("indexed",
+# index)`` for the indexed representation, ``(indexbit, "index", index,
+# huffman_value)`` for a literal with the name taken from the table, or
+# ``(indexbit, "literal", huffman_name, huffman_value)`` for a literal with
+# a literal name, where ``indexbit`` is one of
+# ``INDEX_INCREMENTAL``/``INDEX_NONE``/``INDEX_NEVER``. Indices are resolved
+# when the plan is computed; because the plan is applied in order against a
+# table that evolves exactly as the search simulated, they stay valid.
+_ShortestOption = tuple
+
+
+def _simulation_table(entries: tuple[tuple[bytes, bytes], ...], maxsize: int) -> HeaderTable:
+    """
+    Builds a throwaway :class:`HeaderTable` mirroring a dynamic table state,
+    so that searches and insertions behave exactly like the real table.
+    """
+    table = HeaderTable()
+    table._maxsize = maxsize
+    table.dynamic_entries = deque(entries)
+    table._current_size = sum(table_entry_size(n, v) for n, v in entries)
+    return table
+
+
+def _shortest_transitions(entries: tuple[tuple[bytes, bytes], ...],
+                          maxsize: int,
+                          name: bytes,
+                          value: bytes,
+                          sensitive: bool,
+                          huffman_coder: HuffmanEncoder) \
+        -> Iterable[tuple[_ShortestOption, bytes, tuple[tuple[bytes, bytes], ...]]]:
+    """
+    Yields every legal way to represent a single header field given a dynamic
+    table state, as ``(option, rendered_bytes, new_entries)`` triplets. This
+    never mutates any real encoder state.
+    """
+    table = _simulation_table(entries, maxsize)
+    match = table.search(name, value)
+    perfect_index = match[0] if match is not None and match[2] is not None else None
+
+    if not sensitive and perfect_index is not None:
+        yield ("indexed", perfect_index), _render_indexed(perfect_index), entries
+
+    # The cheapest usable name index is the lowest index whose entry has a
+    # matching name. That is not necessarily the perfect-match index: another
+    # entry may share the name while sitting at a lower (cheaper) index.
+    name_index = None
+    static_match = HeaderTable.STATIC_TABLE_MAPPING.get(name)
+    if static_match is not None:
+        name_index = static_match[0]
+    else:
+        for position, (entry_name, _) in enumerate(entries):
+            if entry_name == name:
+                name_index = HeaderTable.STATIC_TABLE_LENGTH + 1 + position
+                break
+
+    # Sensitive fields must keep their "never indexed" marker, so they may
+    # only use the never-indexed literal form and must not touch the table.
+    # Other fields may choose incremental indexing or no indexing, both of
+    # which decode to a plain, indexable HeaderTuple.
+    indexbits = (INDEX_NEVER,) if sensitive else (INDEX_INCREMENTAL, INDEX_NONE)
+
+    for indexbit in indexbits:
+        if indexbit == INDEX_INCREMENTAL:
+            updated = _simulation_table(entries, maxsize)
+            updated.add(name, value)
+            new_entries = tuple(updated.dynamic_entries)
+        else:
+            new_entries = entries
+
+        if name_index is not None:
+            for huffman_value in (False, True):
+                option = (indexbit, "index", name_index, huffman_value)
+                rendered = _render_indexed_name_literal(
+                    name_index, value, indexbit, huffman_value, huffman_coder,
+                )
+                yield option, rendered, new_entries
+
+        for huffman_name in (False, True):
+            for huffman_value in (False, True):
+                option = (indexbit, "literal", huffman_name, huffman_value)
+                rendered = _render_literal(
+                    name, value, indexbit, huffman_name, huffman_value, huffman_coder,
+                )
+                yield option, rendered, new_entries
+
+
+def _shortest_plan(entries: tuple[tuple[bytes, bytes], ...],
+                   maxsize: int,
+                   headers: list[tuple[bytes, bytes, bool]],
+                   huffman_coder: HuffmanEncoder) -> tuple[_ShortestOption, ...]:
+    """
+    Computes a jointly optimal encoding plan for a small header block.
+
+    This is a dynamic programming search over dynamic table states, *not* a
+    per-field greedy choice: a field may deliberately be encoded with a more
+    expensive representation (for example indexing a field, or re-adding a
+    duplicate of an entry that sits at a high index) when doing so makes the
+    representations of later fields cheaper. The initial dynamic table state
+    (``entries``/``maxsize``) is part of the search, and the returned plan is
+    minimal in the total number of emitted header bytes.
+    """
+    # Each state maps a dynamic table content to the cheapest known way of
+    # reaching it: (total emitted bytes, plan). Because every field adds at
+    # most its own entry, at most 2**i distinct table states are reachable
+    # after i fields, which keeps this exact search cheap for small blocks.
+    states: dict[tuple[tuple[bytes, bytes], ...], tuple[int, tuple[_ShortestOption, ...]]] = {
+        entries: (0, ()),
+    }
+
+    for name, value, sensitive in headers:
+        next_states: dict[tuple[tuple[bytes, bytes], ...], tuple[int, tuple[_ShortestOption, ...]]] = {}
+        for state_entries, (cost, plan) in states.items():
+            for option, rendered, new_entries in _shortest_transitions(
+                state_entries, maxsize, name, value, sensitive, huffman_coder,
+            ):
+                new_cost = cost + len(rendered)
+                current = next_states.get(new_entries)
+                if current is None or new_cost < current[0]:
+                    next_states[new_entries] = (new_cost, plan + (option,))
+        states = next_states
+
+    return min(states.values(), key=lambda item: item[0])[1]
 
 
 class Encoder:
@@ -293,6 +513,115 @@ class Encoder:
         log.debug("Encoded header block to %s", encoded)
 
         return encoded
+
+    def encode_shortest(self,
+                        headers: Iterable[\
+                            HeaderTuple | \
+                            tuple[bytes | str, bytes | str] | \
+                            tuple[bytes | str, bytes | str, bool | None]] | \
+                            dict[bytes | str, bytes | str]) -> bytes:
+        """
+        Takes a small set of headers and encodes them into the shortest
+        HPACK-encoded header block this encoder can legally produce.
+
+        Unlike :meth:`encode`, which always Huffman-encodes every string and
+        indexes every new non-sensitive header, this method jointly chooses,
+        for the whole block and without changing the header order or any
+        sensitive marker:
+
+        - the representation of each field (indexed when the field is in a
+          table, or a literal form),
+        - whether each non-sensitive literal is added to the dynamic table
+          (incremental indexing) or sent without indexing,
+        - whether the name and the value of each literal are Huffman-coded,
+          independently of one another.
+
+        The choice is a true joint optimization over the block (a dynamic
+        programming search over dynamic table states), not a per-field greedy
+        pick: a field may intentionally use a locally more expensive
+        representation when that makes later fields cheaper. The current
+        dynamic table contents and any pending header table size updates are
+        accounted for: the size update bytes are emitted (and counted) at the
+        start of the block exactly as :meth:`encode` would, and the search
+        starts from the table state those updates leave behind. After this
+        method returns, the encoder's dynamic table exactly reflects the
+        representation choices that were emitted.
+
+        .. warning:: This mode is explicitly limited to small header blocks
+            of at most :data:`hpack.hpack.SHORTEST_MAX_HEADERS` (10) fields.
+            Larger blocks are rejected with a :class:`ValueError`; callers
+            with bigger blocks must fall back to :meth:`encode` themselves.
+
+        :param headers: The headers to encode, in any of the forms accepted
+                        by :meth:`encode`.
+        :returns: A bytestring containing the HPACK-encoded header block.
+        :raises ValueError: If more than ``SHORTEST_MAX_HEADERS`` header
+                            fields are provided.
+        """
+        header_list = _normalize_header_list(headers)
+
+        if len(header_list) > SHORTEST_MAX_HEADERS:
+            msg = (
+                f"encode_shortest is limited to blocks of at most "
+                f"{SHORTEST_MAX_HEADERS} header fields, got "
+                f"{len(header_list)}; use encode() for larger blocks"
+            )
+            raise ValueError(msg)
+
+        header_block = []
+
+        # As with encode(), pending table size changes are signalled first.
+        # These bytes are a fixed prefix for every possible plan, and the
+        # resize has already been applied to the dynamic table, so the search
+        # below starts from the post-resize state.
+        if self.header_table.resized:
+            header_block.append(self._encode_table_size_change())
+            self.header_table.resized = False
+
+        plan = _shortest_plan(
+            tuple(self.header_table.dynamic_entries),
+            self.header_table.maxsize,
+            header_list,
+            self.huffman_coder,
+        )
+
+        for (name, value, sensitive), option in zip(header_list, plan):
+            header_block.append(self._apply_shortest_option(name, value, option))
+
+        encoded = b"".join(header_block)
+
+        log.debug("Encoded header block to %s", encoded)
+
+        return encoded
+
+    def _apply_shortest_option(self, name: bytes, value: bytes, option: _ShortestOption) -> bytes:
+        """
+        Renders a single header field according to a plan option computed by
+        :func:`_shortest_plan`, mutating the real header table to match.
+        Table indices were resolved when the plan was computed; the live
+        table evolves exactly as the search simulated, so they are the
+        indices the decoder will see.
+        """
+        if option[0] == "indexed":
+            return _render_indexed(option[1])
+
+        indexbit = option[0]
+        name_kind = option[1]
+
+        if name_kind == "index":
+            rendered = _render_indexed_name_literal(
+                option[2], value, indexbit, option[3], self.huffman_coder,
+            )
+        else:
+            rendered = _render_literal(
+                name, value, indexbit, option[2], option[3],
+                self.huffman_coder,
+            )
+
+        if indexbit == INDEX_INCREMENTAL:
+            self.header_table.add(name, value)
+
+        return rendered
 
     def add(self, to_add: tuple[bytes, bytes], sensitive: bool, huffman: bool = False) -> bytes:
         """

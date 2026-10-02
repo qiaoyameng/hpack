@@ -4,7 +4,7 @@ hpack API
 This document provides the HPACK API.
 
 .. autoclass:: hpack.Encoder
-   :members: header_table_size, encode
+   :members: header_table_size, encode, encode_shortest
 
 .. autoclass:: hpack.Decoder
    :members: header_table_size, decode

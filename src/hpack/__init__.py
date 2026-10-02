@@ -4,7 +4,7 @@ HTTP/2 header encoding for Python.
 from __future__ import annotations
 
 from .exceptions import HPACKDecodingError, HPACKError, InvalidTableIndex, InvalidTableIndexError, InvalidTableSizeError, OversizedHeaderListError
-from .hpack import Decoder, Encoder
+from .hpack import SHORTEST_MAX_HEADERS, Decoder, Encoder
 from .struct import HeaderTuple, NeverIndexedHeaderTuple
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "InvalidTableSizeError",
     "NeverIndexedHeaderTuple",
     "OversizedHeaderListError",
+    "SHORTEST_MAX_HEADERS",
 ]
 
 __version__ = "4.2.0"
