@@ -14,7 +14,7 @@ from .struct import HeaderTuple, HeaderWeaklyTyped, NeverIndexedHeaderTuple
 from .table import HeaderTable, table_entry_size
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable  # pragma: no cover
+    from collections.abc import Hashable, Iterable  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
@@ -165,12 +165,25 @@ class Encoder:
     HTTP/2 header blocks.
     """
 
-    def __init__(self) -> None:
-        self.header_table = HeaderTable()
+    def __init__(self, max_allowed_table_size: int = HeaderTable.DEFAULT_SIZE) -> None:
+        self.max_allowed_table_size = max_allowed_table_size
+        self._default_domain: Hashable = None
+        self._current_domain: Hashable = self._default_domain
+        self._emitted_domain: Hashable = self._default_domain
+        initial_table = HeaderTable()
+        if max_allowed_table_size < initial_table.maxsize:
+            initial_table.maxsize = max_allowed_table_size
+            initial_table.resized = False
+        self.header_table = initial_table
+        self._domain_tables: dict[Hashable, HeaderTable] = {
+            self._default_domain: initial_table,
+        }
+        self._domain_table_size_changes: dict[Hashable, list[int]] = {
+            self._default_domain: [],
+        }
         self.huffman_coder = HuffmanEncoder(
             REQUEST_CODES, REQUEST_CODES_LENGTH,
         )
-        self.table_size_changes: list[int] = []
 
     @property
     def header_table_size(self) -> int:
@@ -181,9 +194,46 @@ class Encoder:
 
     @header_table_size.setter
     def header_table_size(self, value: int) -> None:
+        if value > self.max_allowed_table_size:
+            msg = "Encoder exceeded max allowable table size"
+            raise InvalidTableSizeError(msg)
         self.header_table.maxsize = value
         if self.header_table.resized:
             self.table_size_changes.append(value)
+
+    @property
+    def table_size_changes(self) -> list[int]:
+        return self._domain_table_size_changes[self._current_domain]
+
+    def switch_isolation_domain(self, domain: Hashable) -> None:
+        """
+        Switch the encoder to a separate HPACK dynamic-table isolation domain.
+
+        If the next emitted header block crosses an actual domain boundary, it
+        starts with a dynamic table size update to zero followed by an update
+        back to that domain's table size. Switches that are followed by another
+        switch before encoding are coalesced.
+        """
+        if domain == self._current_domain:
+            return
+
+        table = self._domain_tables.get(domain)
+        if table is None:
+            table = HeaderTable()
+            if self.max_allowed_table_size < table.maxsize:
+                table.maxsize = self.max_allowed_table_size
+                table.resized = False
+            self._domain_tables[domain] = table
+            self._domain_table_size_changes[domain] = []
+
+        self._current_domain = domain
+        self.header_table = table
+
+    def switch_compression_domain(self, domain: Hashable) -> None:
+        """
+        Alias for :meth:`switch_isolation_domain`.
+        """
+        self.switch_isolation_domain(domain)
 
     def encode(self,
                headers: Iterable[\
@@ -244,7 +294,23 @@ class Encoder:
         header_block = []
 
         # Before we begin, if the header table size has been changed we need
-        # to signal all changes since last emission appropriately.
+        # to signal all changes since last emission appropriately. A real
+        # domain boundary must first clear the decoder's dynamic table.
+        if self._current_domain != self._emitted_domain:
+            target_size = min(
+                self.header_table.maxsize,
+                self.max_allowed_table_size,
+            )
+            self.header_table.maxsize = 0
+            if target_size:
+                self.header_table.maxsize = target_size
+            self.table_size_changes.clear()
+            if target_size:
+                self.table_size_changes.extend((0, target_size))
+            else:
+                self.table_size_changes.append(0)
+            self.header_table.resized = True
+
         if self.header_table.resized:
             header_block.append(self._encode_table_size_change())
             self.header_table.resized = False
@@ -289,6 +355,8 @@ class Encoder:
             header_block.append(self.add(new_header, sensitive, huffman))
 
         encoded = b"".join(header_block)
+
+        self._emitted_domain = self._current_domain
 
         log.debug("Encoded header block to %s", encoded)
 
@@ -411,7 +479,7 @@ class Encoder:
             b = encode_integer(size_bytes, 5)
             b[0] |= 0x20
             block += bytes(b)
-        self.table_size_changes = []
+        self._domain_table_size_changes[self._current_domain] = []
         return block
 
 

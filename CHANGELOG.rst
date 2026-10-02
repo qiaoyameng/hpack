@@ -1,6 +1,13 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added ``Encoder.switch_isolation_domain()`` (with ``switch_compression_domain()`` as an alias) to begin a HPACK dynamic table isolation domain at the next header block.
+
 4.2.0 (2026-06-22)
 ------------------
 

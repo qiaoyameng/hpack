@@ -15,6 +15,20 @@ from hpack import (
     InvalidTableSizeError,
 )
 from hpack.hpack import _dict_to_iterable, _to_bytes
+from hpack.table import HeaderTable
+
+
+class RecordingHeaderTable(HeaderTable):
+    def __init__(self):
+        super().__init__()
+        self.dynamic_index_lookups = []
+
+    def get_by_index(self, index):
+        if index > HeaderTable.STATIC_TABLE_LENGTH:
+            dynamic_index = index - HeaderTable.STATIC_TABLE_LENGTH - 1
+            entry = self.dynamic_entries[dynamic_index]
+            self.dynamic_index_lookups.append((entry, tuple(self.dynamic_entries)))
+        return super().get_by_index(index)
 
 
 def test_to_bytes():
@@ -356,6 +370,145 @@ class TestHPACKEncoder:
         e.encode(header_set)
 
         assert len(e.header_table.dynamic_entries) == 1
+
+    def test_isolation_domains_share_persistent_decoder(self):
+        e = Encoder()
+        d = Decoder()
+        d.header_table = RecordingHeaderTable()
+
+        a_headers = [
+            HeaderTuple(b":method", b"GET"),
+            HeaderTuple(b"tenant-header", b"tenant-a-value"),
+            NeverIndexedHeaderTuple(b"tenant-secret", b"tenant-a-secret"),
+        ]
+        b_headers = [
+            HeaderTuple(b":method", b"GET"),
+            HeaderTuple(b"tenant-header", b"tenant-b-value"),
+            NeverIndexedHeaderTuple(b"tenant-secret", b"tenant-b-secret"),
+        ]
+
+        a_one = e.encode(a_headers, huffman=False)
+        a_two = e.encode(a_headers, huffman=False)
+        assert a_two.startswith(b"\x82\xbe")
+
+        e.switch_isolation_domain("B")
+        b_block = e.encode(b_headers, huffman=False)
+        assert b_block.startswith(b"\x20\x3f\xe1\x1f")
+
+        e.switch_isolation_domain(None)
+        a_three = e.encode(a_headers, huffman=False)
+        assert a_three.startswith(b"\x20\x3f\xe1\x1f")
+
+        decoded_blocks = []
+        lookup_snapshots = []
+        for block in (a_one, a_two, b_block, a_three):
+            d.header_table.dynamic_index_lookups.clear()
+            decoded_blocks.append(d.decode(block, raw=True))
+            lookup_snapshots.append(list(d.header_table.dynamic_index_lookups))
+
+        assert len(lookup_snapshots[1]) == 1
+        assert lookup_snapshots[1][0][0] == (b"tenant-header", b"tenant-a-value")
+        assert lookup_snapshots[2] == []
+        assert lookup_snapshots[3] == []
+
+        assert decoded_blocks == [a_headers, a_headers, b_headers, a_headers]
+        assert all(not block[2].indexable for block in decoded_blocks)
+
+        assert all(
+            entry != (b"tenant-secret", b"tenant-a-secret")
+            for lookups in lookup_snapshots
+            for entry, _ in lookups
+        )
+
+    def test_compression_recovers_within_reentered_domain(self):
+        e = Encoder()
+        d = Decoder()
+        headers = [
+            HeaderTuple(b":method", b"GET"),
+            HeaderTuple(b"tenant-header", b"tenant-a-value"),
+        ]
+
+        first = e.encode(headers, huffman=False)
+        second = e.encode(headers, huffman=False)
+        e.switch_isolation_domain("B")
+        b_block = e.encode(
+            [HeaderTuple(b":method", b"GET"), HeaderTuple(b"tenant-header", b"tenant-b-value")],
+            huffman=False,
+        )
+        e.switch_isolation_domain(None)
+        reentered = e.encode(headers, huffman=False)
+        repeated = e.encode(headers, huffman=False)
+
+        assert second.startswith(b"\x82\xbe")
+        assert reentered.startswith(b"\x20\x3f\xe1\x1f")
+        assert repeated.startswith(b"\x82\xbe")
+
+        for block in (first, second, b_block, reentered, repeated):
+            d.decode(block, raw=True)
+
+    def test_consecutive_domain_switches_are_coalesced(self):
+        e = Encoder()
+
+        e.switch_isolation_domain("A")
+        e.switch_isolation_domain("B")
+        e.switch_isolation_domain("A")
+        e.switch_isolation_domain("A")
+
+        out = e.encode([(":method", "GET")], huffman=False)
+
+        assert out == b"\x20\x3f\xe1\x1f\x82"
+
+    def test_domain_switch_with_zero_table_size_emits_one_update(self):
+        e = Encoder()
+        d = Decoder()
+
+        e.switch_compression_domain("B")
+        e.header_table_size = 0
+        out = e.encode([(":method", "GET")], huffman=False)
+
+        assert out == b"\x20\x82"
+        assert d.decode(out, raw=True) == [HeaderTuple(b":method", b"GET")]
+
+    def test_switching_back_before_encoding_retains_compression(self):
+        e = Encoder()
+        headers = [("tenant-header", "tenant-a-value")]
+
+        e.encode(headers, huffman=False)
+        e.switch_isolation_domain("B")
+        e.switch_isolation_domain(None)
+        out = e.encode(headers, huffman=False)
+
+        assert out == b"\xbe"
+
+    def test_table_size_changes_and_switches_are_coalesced(self):
+        e = Encoder()
+
+        e.encode([(":method", "GET")], huffman=False)
+        e.header_table_size = 100
+        e.switch_isolation_domain("B")
+        e.header_table_size = 200
+
+        out = e.encode([(":method", "GET")], huffman=False)
+
+        assert out == b"\x20\x3f\xa9\x01\x82"
+
+    def test_domain_restore_uses_negotiated_table_size_limit(self):
+        e = Encoder(max_allowed_table_size=128)
+        d = Decoder()
+        d.max_allowed_table_size = 128
+
+        e.switch_isolation_domain("B")
+        assert e.header_table_size == 128
+        out = e.encode([(":method", "GET")], huffman=False)
+
+        assert out == b"\x20\x3f\x61\x82"
+        assert d.decode(out, raw=True) == [HeaderTuple(b":method", b"GET")]
+
+    def test_encoder_rejects_table_size_above_negotiated_limit(self):
+        e = Encoder(max_allowed_table_size=128)
+
+        with pytest.raises(InvalidTableSizeError):
+            e.header_table_size = 129
 
     def test_headers_generator(self):
         e = Encoder()
