@@ -41,7 +41,21 @@ Quickstart:
     encoded_bytes = e.encode(headers)
 
     d = Decoder()
-    decoded_headers = d.decode(encoded_bytes)
+decoded_headers = d.decode(encoded_bytes)
+
+Headers arriving in multiple HTTP/2 frames can be decoded incrementally:
+
+.. code-block:: python
+
+    d = Decoder()
+    d.begin_header_block()
+    headers = []
+    for frame_payload in frame_payloads:
+        headers.extend(d.feed_header_block(frame_payload))
+    d.end_header_block()
+
+If a decoding error occurs, ``d.failed`` becomes ``True`` and that decoder
+must not be reused.
 
 
 Contributing

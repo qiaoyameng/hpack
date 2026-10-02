@@ -80,48 +80,61 @@ def decode_huffman(huffman_string: bytes | bytearray | memoryview | None) -> byt
     Given a bytestring of Huffman-encoded data for HPACK, returns a bytestring
     of the decompressed data.
     """
-    if not huffman_string:
-        return b""
+    return HuffmanDecoder().feed(huffman_string).finish()
 
-    state = 0
-    flags = 0
-    decoded_bytes = bytearray()
 
-    # Perversely, bytearrays are a lot more convenient across Python 2 and
-    # Python 3 because they behave *the same way* on both platforms. Given that
-    # we really do want numerical bytes when we iterate here, let's use a
-    # bytearray.
-    huffman_string = bytearray(huffman_string)
+class HuffmanDecoder:
+    """
+    Decodes HPACK Huffman data across one or more byte chunks.
+    """
 
-    # This loop is unrolled somewhat. Because we use a nibble, not a byte, we
-    # need to handle each nibble twice. We unroll that: it makes the loop body
-    # a bit longer, but that's ok.
-    for input_byte in huffman_string:
-        index = (state * 16) + (input_byte >> 4)
-        state, flags, output_byte = HUFFMAN_TABLE[index]
+    __slots__ = ("_fed", "_flags", "_state", "decoded_bytes")
 
-        if flags & HUFFMAN_FAIL:
-            msg = "Invalid Huffman string"
+    def __init__(self) -> None:
+        self._state = 0
+        self._flags = 0
+        self._fed = False
+        self.decoded_bytes = bytearray()
+
+    def feed(self, huffman_string: bytes | bytearray | memoryview | None) -> HuffmanDecoder:
+        if not huffman_string:
+            return self
+
+        self._fed = True
+        huffman_string = bytearray(huffman_string)
+
+        for input_byte in huffman_string:
+            index = (self._state * 16) + (input_byte >> 4)
+            self._state, self._flags, output_byte = HUFFMAN_TABLE[index]
+
+            if self._flags & HUFFMAN_FAIL:
+                msg = "Invalid Huffman string"
+                raise HPACKDecodingError(msg)
+
+            if self._flags & HUFFMAN_EMIT_SYMBOL:
+                self.decoded_bytes.append(output_byte)
+
+            index = (self._state * 16) + (input_byte & 0x0F)
+            self._state, self._flags, output_byte = HUFFMAN_TABLE[index]
+
+            if self._flags & HUFFMAN_FAIL:
+                msg = "Invalid Huffman string"
+                raise HPACKDecodingError(msg)
+
+            if self._flags & HUFFMAN_EMIT_SYMBOL:
+                self.decoded_bytes.append(output_byte)
+
+        return self
+
+    def finish(self) -> bytes:
+        if not self._fed:
+            return b""
+
+        if not (self._flags & HUFFMAN_COMPLETE):
+            msg = "Incomplete Huffman string"
             raise HPACKDecodingError(msg)
 
-        if flags & HUFFMAN_EMIT_SYMBOL:
-            decoded_bytes.append(output_byte)
-
-        index = (state * 16) + (input_byte & 0x0F)
-        state, flags, output_byte = HUFFMAN_TABLE[index]
-
-        if flags & HUFFMAN_FAIL:
-            msg = "Invalid Huffman string"
-            raise HPACKDecodingError(msg)
-
-        if flags & HUFFMAN_EMIT_SYMBOL:
-            decoded_bytes.append(output_byte)
-
-    if not (flags & HUFFMAN_COMPLETE):
-        msg = "Incomplete Huffman string"
-        raise HPACKDecodingError(msg)
-
-    return bytes(decoded_bytes)
+        return bytes(self.decoded_bytes)
 
 
 # Some decoder flags to control state transitions.

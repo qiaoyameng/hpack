@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from .exceptions import HPACKDecodingError, InvalidTableSizeError, OversizedHeaderListError
 from .huffman import HuffmanEncoder
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
-from .huffman_table import decode_huffman
+from .huffman_table import HuffmanDecoder
 from .struct import HeaderTuple, HeaderWeaklyTyped, NeverIndexedHeaderTuple
 from .table import HeaderTable, table_entry_size
 
@@ -415,6 +415,283 @@ class Encoder:
         return block
 
 
+class _IntegerReader:
+    __slots__ = (
+        "awaiting_continuation", "continuation_count", "first_byte", "number",
+        "prefix_bits", "shift",
+    )
+
+    def __init__(self, first_byte: int, prefix_bits: int) -> None:
+        self.first_byte = first_byte
+        self.prefix_bits = prefix_bits
+        self.number = first_byte & _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
+        self.shift = 0
+        self.continuation_count = 0
+        self.awaiting_continuation = self.number == _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
+
+    @property
+    def needs_continuation(self) -> bool:
+        return self.awaiting_continuation
+
+    def feed(self, byte: int) -> bool:
+        self.continuation_count += 1
+        if self.continuation_count >= VARINT_MAX_LENGTH:
+            msg = "Variable integer representation is too long"
+            raise HPACKDecodingError(msg)
+
+        if byte >= 128:
+            self.number += (byte - 128) << self.shift
+            self.shift += 7
+            return False
+
+        self.number += byte << self.shift
+        self.awaiting_continuation = False
+        return True
+
+
+class _HeaderBlockParser:
+    _STATE_REPRESENTATION = 0
+    _STATE_INTEGER = 1
+    _STATE_STRING = 2
+
+    _TARGET_INDEXED = "indexed"
+    _TARGET_TABLE_SIZE = "table_size"
+    _TARGET_NAME_INDEX = "name_index"
+    _TARGET_NAME_LENGTH = "name_length"
+    _TARGET_VALUE_LENGTH = "value_length"
+
+    __slots__ = (
+        "buffer", "decoder", "headers", "headers_seen", "inflated_size",
+        "integer_prefix_bits", "integer_reader", "integer_target",
+        "literal_mode", "max_header_list_size", "name", "state",
+        "string_huffman", "string_is_name", "string_length", "string_output",
+        "huffman_decoder", "table",
+    )
+
+    def __init__(self, decoder: Decoder, max_header_list_size: int) -> None:
+        self.decoder = decoder
+        self.table = decoder.header_table
+        self.max_header_list_size = max_header_list_size
+        self.buffer = bytearray()
+        self.headers: list[HeaderTuple] = []
+        self.headers_seen = False
+        self.inflated_size = 0
+        self.state = self._STATE_REPRESENTATION
+        self.integer_reader: _IntegerReader | None = None
+        self.integer_target = ""
+        self.integer_prefix_bits = 0
+        self.literal_mode = 0
+        self.name: bytes | None = None
+        self.string_huffman = False
+        self.string_is_name = False
+        self.string_length = 0
+        self.string_output = bytearray()
+        self.huffman_decoder: HuffmanDecoder | None = None
+
+    def feed(self, data: bytes | bytearray | memoryview) -> list[HeaderTuple]:
+        before = len(self.headers)
+        self.buffer.extend(data)
+        consumed = self._drain()
+        del self.buffer[:consumed]
+        return self.headers[before:]
+
+    def end(self) -> None:
+        if self.state != self._STATE_REPRESENTATION or self.buffer:
+            msg = "Truncated header block"
+            raise HPACKDecodingError(msg)
+        self.decoder._assert_valid_table_size()
+
+    def _drain(self) -> int:
+        consumed = 0
+
+        while consumed < len(self.buffer):
+            if self.state == self._STATE_REPRESENTATION:
+                self._start_representation(self.buffer[consumed])
+                consumed += 1
+
+            if self.state == self._STATE_INTEGER:
+                if self.integer_reader is None:
+                    if consumed >= len(self.buffer):
+                        return consumed
+                    self._begin_integer(
+                        self.buffer[consumed],
+                        self.integer_prefix_bits,
+                        self.integer_target,
+                    )
+                    consumed += 1
+
+                if self.integer_reader is not None and self.integer_reader.needs_continuation:
+                    complete = False
+                    while consumed < len(self.buffer):
+                        complete = self.integer_reader.feed(self.buffer[consumed])
+                        consumed += 1
+                        if complete:
+                            self._finish_integer(self.integer_reader.number)
+                            break
+                    if not complete:
+                        return consumed
+                elif self.integer_reader is not None:
+                    self._finish_integer(self.integer_reader.number)
+
+            if self.state == self._STATE_STRING:
+                consumed = self._consume_string(consumed)
+                if self.state == self._STATE_STRING:
+                    return consumed
+
+        return consumed
+
+    def _start_representation(self, first_byte: int) -> None:
+        if first_byte & 0x80:
+            self._begin_integer(first_byte, 7, self._TARGET_INDEXED)
+            return
+
+        if first_byte & 0x40:
+            self.literal_mode = 0x40
+            indexed_name = first_byte & 0x3F
+            if indexed_name:
+                self._begin_integer(first_byte, 6, self._TARGET_NAME_INDEX)
+            else:
+                self._await_string_length(self._TARGET_NAME_LENGTH, 7)
+            return
+
+        if first_byte & 0x20:
+            if self.headers_seen:
+                msg = "Table size update not at the start of the block"
+                raise HPACKDecodingError(msg)
+            self._begin_integer(first_byte, 5, self._TARGET_TABLE_SIZE)
+            return
+
+        self.literal_mode = first_byte & 0x10
+        indexed_name = first_byte & 0x0F
+        if indexed_name:
+            self._begin_integer(first_byte, 4, self._TARGET_NAME_INDEX)
+        else:
+            self._await_string_length(self._TARGET_NAME_LENGTH, 7)
+
+    def _begin_integer(self, first_byte: int, prefix_bits: int, target: str) -> None:
+        self.integer_target = target
+        self.integer_prefix_bits = prefix_bits
+        self.integer_reader = _IntegerReader(first_byte, prefix_bits)
+        if not self.integer_reader.needs_continuation:
+            self._finish_integer(self.integer_reader.number)
+        else:
+            self.state = self._STATE_INTEGER
+
+    def _await_string_length(self, target: str, prefix_bits: int) -> None:
+        self.state = self._STATE_INTEGER
+        self.integer_target = target
+        self.integer_prefix_bits = prefix_bits
+        self.integer_reader = None
+
+    def _finish_integer(self, value: int) -> None:
+        reader = self.integer_reader
+        self.integer_reader = None
+        target = self.integer_target
+
+        if target == self._TARGET_INDEXED:
+            header = HeaderTuple(*self.table.get_by_index(value))
+            self._emit(header)
+            self.state = self._STATE_REPRESENTATION
+        elif target == self._TARGET_TABLE_SIZE:
+            if value > self.decoder.max_allowed_table_size:
+                msg = "Encoder exceeded max allowable table size"
+                raise InvalidTableSizeError(msg)
+            self.decoder.header_table_size = value
+            self.state = self._STATE_REPRESENTATION
+        elif target == self._TARGET_NAME_INDEX:
+            self.name = self.table.get_by_index(value)[0]
+            self._await_string_length(self._TARGET_VALUE_LENGTH, 7)
+        elif target == self._TARGET_NAME_LENGTH:
+            self.string_is_name = True
+            assert reader is not None
+            self._begin_string(value, reader.first_byte & 0x80)
+        elif target == self._TARGET_VALUE_LENGTH:
+            self.string_is_name = False
+            assert reader is not None
+            self._begin_string(value, reader.first_byte & 0x80)
+
+    def _begin_string(self, length: int, huffman: int) -> None:
+        self.string_length = length
+        self.string_huffman = bool(huffman)
+        self.string_output = bytearray()
+        self.huffman_decoder = HuffmanDecoder() if self.string_huffman else None
+        self.state = self._STATE_STRING
+
+    def _consume_string(self, offset: int) -> int:
+        available = min(self.string_length, len(self.buffer) - offset)
+        if available:
+            chunk = self.buffer[offset:offset + available]
+            if self.string_huffman:
+                assert self.huffman_decoder is not None
+                self.huffman_decoder.feed(chunk)
+            else:
+                self.string_output.extend(chunk)
+            self.string_length -= available
+            offset += available
+            self._check_partial_header_size()
+
+        if self.string_length:
+            return offset
+
+        if self.string_huffman:
+            assert self.huffman_decoder is not None
+            value = self.huffman_decoder.finish()
+        else:
+            value = bytes(self.string_output)
+        self._finish_string(value)
+        return offset
+
+    def _finish_string(self, value: bytes) -> None:
+        self.huffman_decoder = None
+        self.string_output = bytearray()
+
+        if self.string_is_name:
+            self.name = value
+            self._await_string_length(self._TARGET_VALUE_LENGTH, 7)
+            return
+
+        assert self.name is not None
+        if self.literal_mode == 0x10:
+            header: HeaderTuple = NeverIndexedHeaderTuple(self.name, value)
+        else:
+            header = HeaderTuple(self.name, value)
+
+        if self.literal_mode == 0x40:
+            self.table.add(self.name, value)
+        self.name = None
+        self._emit(header)
+        self.state = self._STATE_REPRESENTATION
+
+    def _check_partial_header_size(self) -> int:
+        name_length = len(self.name) if self.name is not None else 0
+        decoded_length = len(self.string_output)
+        if self.string_is_name:
+            name_length = 0
+        if self.string_huffman:
+            assert self.huffman_decoder is not None
+            decoded_length = len(self.huffman_decoder.decoded_bytes)
+
+        if self.string_is_name:
+            name_length = decoded_length
+            value_length = 0
+        else:
+            value_length = decoded_length
+
+        current_size = self.inflated_size + 32 + name_length + value_length
+        if current_size > self.max_header_list_size:
+            msg = f"A header list larger than {self.max_header_list_size} has been received"
+            raise OversizedHeaderListError(msg)
+        return current_size
+
+    def _emit(self, header: HeaderTuple) -> None:
+        self.headers_seen = True
+        self.headers.append(header)
+        self.inflated_size += table_entry_size(header[0], header[1])
+        if self.inflated_size > self.max_header_list_size:
+            msg = f"A header list larger than {self.max_header_list_size} has been received"
+            raise OversizedHeaderListError(msg)
+
+
 class Decoder:
     """
     An HPACK decoder object.
@@ -435,6 +712,12 @@ class Decoder:
 
         Defaults to 64kB.
     :type max_header_list_size: ``int``
+
+    Header blocks may be supplied either as one complete bytestring to
+    :meth:`decode` or in chunks to :meth:`begin_header_block`,
+    :meth:`feed_header_block` and :meth:`end_header_block`. If decoding fails,
+    :attr:`failed` becomes ``True`` and the persistent HPACK context must be
+    discarded.
     """
 
     def __init__(self, max_header_list_size: int = DEFAULT_MAX_HEADER_LIST_SIZE) -> None:
@@ -446,7 +729,7 @@ class Decoder:
         #: into a really large header list, allowing enormous amounts of memory
         #: to be allocated.
         #:
-        #: If this amount of data is exceeded, a `OversizedHeaderListError
+        #: If this amount is exceeded, a `OversizedHeaderListError
         #: <hpack.OversizedHeaderListError>` exception will be raised. At this
         #: point the connection should be shut down, as the HPACK state will no
         #: longer be usable.
@@ -465,6 +748,11 @@ class Decoder:
         #: to confirm that it fits in this size.
         self.max_allowed_table_size = self.header_table.maxsize
 
+        #: Whether a prior decoding error has made this context unusable.
+        self.failed = False
+        self._block_parser: _HeaderBlockParser | None = None
+        self._block_raw = False
+
     @property
     def header_table_size(self) -> int:
         """
@@ -476,7 +764,61 @@ class Decoder:
     def header_table_size(self, value: int) -> None:
         self.header_table.maxsize = value
 
-    def decode(self, data: bytes, raw: bool = False) -> Iterable[HeaderTuple]:
+    def begin_header_block(self, raw: bool = False) -> None:
+        """
+        Begin decoding one HPACK header block supplied in chunks.
+        """
+        self._ensure_usable()
+        if self._block_parser is not None:
+            msg = "A HPACK header block has already been started"
+            raise HPACKDecodingError(msg)
+        self._block_raw = raw
+        self._block_parser = _HeaderBlockParser(self, self.max_header_list_size)
+
+    def feed_header_block(self, data: bytes | bytearray | memoryview) -> list[HeaderTuple]:
+        """
+        Feed one byte chunk of a started HPACK header block and return complete
+        headers that became available in this chunk.
+        """
+        self._ensure_usable()
+        parser = self._require_active_block()
+        try:
+            headers = parser.feed(data)
+            return self._convert_headers(headers)
+        except HPACKDecodingError:
+            self.fail()
+            raise
+
+    def end_header_block(self) -> list[HeaderTuple]:
+        """
+        Mark a streamed HPACK header block complete and validate its boundary.
+
+        :raises HPACKDecodingError: If any integer, string payload, Huffman
+                                    symbol or other representation remains
+                                    incomplete.
+        """
+        self._ensure_usable()
+        parser = self._require_active_block()
+        try:
+            parser.end()
+            self._block_parser = None
+            return []
+        except HPACKDecodingError:
+            self.fail()
+            raise
+
+    def fail(self) -> None:
+        """
+        Mark the persistent HPACK compression context as unusable.
+        """
+        self.failed = True
+        self._block_parser = None
+
+    def decode(
+        self,
+        data: bytes | bytearray | memoryview,
+        raw: bool = False,
+    ) -> list[HeaderTuple]:
         """
         Takes an HPACK-encoded header block and decodes it into a header set.
 
@@ -492,69 +834,39 @@ class Decoder:
                                     the header block.
         """
         log.debug("Decoding %s", data)
+        self._ensure_usable()
 
-        data_mem = memoryview(data)
-        headers: list[HeaderTuple] = []
-        data_len = len(data)
-        inflated_size = 0
-        current_index = 0
-
-        while current_index < data_len:
-            # Work out what kind of header we're decoding.
-            # If the high bit is 1, it's an indexed field.
-            current = data[current_index]
-            indexed = bool(current & 0x80)
-
-            # Otherwise, if the second-highest bit is 1 it's a field that does
-            # alter the header table.
-            literal_index = bool(current & 0x40)
-
-            # Otherwise, if the third-highest bit is 1 it's an encoding context
-            # update.
-            encoding_update = bool(current & 0x20)
-
-            if indexed:
-                header, consumed = self._decode_indexed(
-                    data_mem[current_index:],
-                )
-            elif literal_index:
-                # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal_index(
-                    data_mem[current_index:],
-                )
-            elif encoding_update:
-                # It's an update to the encoding context. These are forbidden
-                # in a header block after any actual header.
-                if headers:
-                    msg = "Table size update not at the start of the block"
-                    raise HPACKDecodingError(msg)
-                consumed = self._update_encoding_context(
-                    data_mem[current_index:],
-                )
-                header = None
-            else:
-                # It's a literal header that does not affect the header table.
-                header, consumed = self._decode_literal_no_index(
-                    data_mem[current_index:],
-                )
-
-            if header:
-                headers.append(header)
-                inflated_size += table_entry_size(header[0], header[1])
-
-                if inflated_size > self.max_header_list_size:
-                    msg = f"A header list larger than {self.max_header_list_size} has been received"
-                    raise OversizedHeaderListError(msg)
-
-            current_index += consumed
-
-        # Confirm that the table size is lower than the maximum. We do this
-        # here to ensure that we catch when the max has been *shrunk* and the
-        # remote peer hasn't actually done that.
-        self._assert_valid_table_size()
+        parser = _HeaderBlockParser(self, self.max_header_list_size)
+        try:
+            headers = parser.feed(data)
+            parser.end()
+        except HPACKDecodingError:
+            self.fail()
+            raise
 
         try:
-            return [_unicode_if_needed(h, raw) for h in headers]
+            return self._convert_headers(headers, raw)
+        except HPACKDecodingError:
+            self.fail()
+            raise
+
+    def _ensure_usable(self) -> None:
+        if self.failed:
+            msg = "HPACK decoder has failed and must not be reused"
+            raise HPACKDecodingError(msg)
+
+    def _require_active_block(self) -> _HeaderBlockParser:
+        parser = self._block_parser
+        if parser is None:
+            msg = "No HPACK header block has been started"
+            raise HPACKDecodingError(msg)
+        return parser
+
+    def _convert_headers(self, headers: list[HeaderTuple], raw: bool | None = None) -> list[HeaderTuple]:
+        if raw is None:
+            raw = self._block_raw
+        try:
+            return [_unicode_if_needed(header, raw) for header in headers]
         except UnicodeDecodeError as err:
             msg = "Unable to decode headers as UTF-8"
             raise HPACKDecodingError(msg) from err
@@ -567,111 +879,3 @@ class Decoder:
         if self.header_table_size > self.max_allowed_table_size:
             msg = "Encoder did not shrink table size to within the max"
             raise InvalidTableSizeError(msg)
-
-    def _update_encoding_context(self, data: bytes | memoryview) -> int:
-        """
-        Handles a byte that updates the encoding context.
-        """
-        # We've been asked to resize the header table.
-        new_size, consumed = decode_integer(data, 5)
-        if new_size > self.max_allowed_table_size:
-            msg = "Encoder exceeded max allowable table size"
-            raise InvalidTableSizeError(msg)
-        self.header_table_size = new_size
-        return consumed
-
-    def _decode_indexed(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
-        """
-        Decodes a header represented using the indexed representation.
-        """
-        index, consumed = decode_integer(data, 7)
-        header = HeaderTuple(*self.header_table.get_by_index(index))
-        log.debug("Decoded %s, consumed %d", header, consumed)
-        return header, consumed
-
-    def _decode_literal_no_index(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
-        return self._decode_literal(data, should_index=False)
-
-    def _decode_literal_index(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
-        return self._decode_literal(data, should_index=True)
-
-    def _decode_literal(self, data: bytes | memoryview, should_index: bool) -> tuple[HeaderTuple, int]:
-        """
-        Decodes a header represented with a literal.
-        """
-        if isinstance(data, memoryview):
-            data = data.tobytes()  # pragma: no cover
-
-        total_consumed = 0
-
-        # When should_index is true, if the low six bits of the first byte are
-        # nonzero, the header name is indexed.
-        # When should_index is false, if the low four bits of the first byte
-        # are nonzero the header name is indexed.
-        if should_index:
-            indexed_name = data[0] & 0x3F
-            name_len = 6
-            not_indexable = False
-        else:
-            high_byte = data[0]
-            indexed_name = high_byte & 0x0F
-            name_len = 4
-            not_indexable = bool(high_byte & 0x10)
-
-        if indexed_name:
-            # Indexed header name.
-            index, consumed = decode_integer(data, name_len)
-            name = self.header_table.get_by_index(index)[0]
-
-            total_consumed = consumed
-            length = 0
-        else:
-            # Literal header name. The first byte was consumed, so we need to
-            # move forward.
-            data = data[1:]
-
-            length, consumed = decode_integer(data, 7)
-            name = data[consumed:consumed + length]
-            if len(name) != length:
-                msg = "Truncated header block"
-                raise HPACKDecodingError(msg)
-
-            if data[0] & 0x80:
-                name = decode_huffman(name)
-            total_consumed = consumed + length + 1  # Since we moved forward 1.
-
-        data = data[consumed + length:]
-
-        # The header value is definitely length-based.
-        length, consumed = decode_integer(data, 7)
-        value = data[consumed:consumed + length]
-        if len(value) != length:
-            msg = "Truncated header block"
-            raise HPACKDecodingError(msg)
-
-        if data[0] & 0x80:
-            value = decode_huffman(value)
-
-        # Updated the total consumed length.
-        total_consumed += length + consumed
-
-        # If we have been told never to index the header field, encode that in
-        # the tuple we use.
-        header: HeaderTuple
-        if not_indexable:
-            header = NeverIndexedHeaderTuple(name, value)
-        else:
-            header = HeaderTuple(name, value)
-
-        # If we've been asked to index this, add it to the header table.
-        if should_index:
-            self.header_table.add(name, value)
-
-        log.debug(
-            "Decoded %s, total consumed %d bytes, indexed %s",
-            header,
-            total_consumed,
-            should_index,
-        )
-
-        return header, total_consumed
