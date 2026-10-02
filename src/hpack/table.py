@@ -113,6 +113,14 @@ class HeaderTable:
         self.resized = False
         self.dynamic_entries: deque[tuple[bytes, bytes]] = deque()
 
+    def _snapshot(self) -> tuple[deque[tuple[bytes, bytes]], int]:
+        return deque(self.dynamic_entries), self._current_size
+
+    def _restore(self, state: tuple[deque[tuple[bytes, bytes]], int]) -> None:
+        dynamic_entries, current_size = state
+        self.dynamic_entries = deque(dynamic_entries)
+        self._current_size = current_size
+
     def get_by_index(self, index: int) -> tuple[bytes, bytes]:
         """
         Returns the entry specified by index

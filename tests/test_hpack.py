@@ -367,6 +367,85 @@ class TestHPACKEncoder:
         out = e.encode(header_set)
         assert Decoder().decode(out) == list(headers_generator())
 
+    def test_failed_iterator_does_not_advance_encoding_state(self):
+        encoder = Encoder()
+        previous_header = ("previous-key", "previous-value")
+        header = ("custom-key", "custom-header")
+
+        first_block = encoder.encode([previous_header], huffman=False)
+        synchronized_decoder = Decoder()
+        assert synchronized_decoder.decode(first_block) == [previous_header]
+
+        def failing_headers():
+            yield header
+            raise RuntimeError("iterator failure")
+
+        with pytest.raises(RuntimeError, match="iterator failure"):
+            encoder.encode(failing_headers(), huffman=False)
+
+        assert list(encoder.header_table.dynamic_entries) == [
+            (b"previous-key", b"previous-value"),
+        ]
+
+        reused_previous = encoder.encode([previous_header], huffman=False)
+        assert reused_previous == b"\xbe"
+        assert synchronized_decoder.decode(reused_previous) == [previous_header]
+
+        recovered = encoder.encode([header], huffman=False)
+        assert recovered.startswith(b"\x40\x0acustom-key\rcustom-header")
+        decoder = Decoder()
+        assert decoder.decode(recovered) == [header]
+
+        reused = encoder.encode([header], huffman=False)
+        assert reused == b"\xbe"
+        assert decoder.decode(reused) == [header]
+
+    def test_header_value_conversion_failure_does_not_advance_state(self):
+        encoder = Encoder()
+        header = ("custom-key", "custom-header")
+
+        class UnencodableValue:
+            def __str__(self):
+                raise ValueError("value conversion failure")
+
+        with pytest.raises(ValueError, match="value conversion failure"):
+            encoder.encode(
+                [header, ("bad-header", UnencodableValue())],
+                huffman=False,
+            )
+
+        assert list(encoder.header_table.dynamic_entries) == []
+
+        recovered = encoder.encode([header], huffman=False)
+        assert Decoder().decode(recovered) == [header]
+
+    def test_failed_encode_retains_queued_table_size_updates(self):
+        encoder = Encoder()
+        encoder.header_table_size = 40
+        encoder.header_table_size = 100
+        header = ("custom-key", "custom-header")
+
+        def failing_headers():
+            yield header
+            raise RuntimeError("iterator failure")
+
+        with pytest.raises(RuntimeError, match="iterator failure"):
+            encoder.encode(failing_headers(), huffman=False)
+
+        assert encoder.table_size_changes == [40, 100]
+        assert encoder.header_table.resized is True
+        assert list(encoder.header_table.dynamic_entries) == []
+
+        recovered = encoder.encode([header], huffman=False)
+        assert recovered.startswith(b"?\t?E")
+
+        decoder = Decoder()
+        assert decoder.decode(recovered) == [header]
+        assert decoder.header_table_size == 100
+        assert list(decoder.header_table.dynamic_entries) == [
+            (b"custom-key", b"custom-header"),
+        ]
+
 
 class TestHPACKDecoder:
     # These tests are stolen entirely from the IETF specification examples.

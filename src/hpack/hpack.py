@@ -247,7 +247,6 @@ class Encoder:
         # to signal all changes since last emission appropriately.
         if self.header_table.resized:
             header_block.append(self._encode_table_size_change())
-            self.header_table.resized = False
 
         if isinstance(headers, dict):
             # Turn the headers into a list of tuples if possible. This is the
@@ -276,19 +275,28 @@ class Encoder:
             """
             hpack_headers = iter(headers)  # type: ignore
 
+        table_state = self.header_table._snapshot()  # noqa: SLF001
+
         # Add each header to the header block
-        for header in hpack_headers:
-            sensitive = False
-            if isinstance(header, HeaderTuple):
-                # HeaderTuple implies it's a 2-tuple with the sensitive information stored as instance attribute
-                sensitive = not header.indexable
-            elif len(header) > 2:
-                sensitive = header[2]
+        try:
+            for header in hpack_headers:
+                sensitive = False
+                if isinstance(header, HeaderTuple):
+                    # HeaderTuple implies it's a 2-tuple with the sensitive information stored as instance attribute
+                    sensitive = not header.indexable
+                elif len(header) > 2:
+                    sensitive = header[2]
 
-            new_header = (_to_bytes(header[0]), _to_bytes(header[1]))
-            header_block.append(self.add(new_header, sensitive, huffman))
+                new_header = (_to_bytes(header[0]), _to_bytes(header[1]))
+                header_block.append(self.add(new_header, sensitive, huffman))
 
-        encoded = b"".join(header_block)
+            encoded = b"".join(header_block)
+        except Exception:  # noqa: BLE001
+            self.header_table._restore(table_state)  # noqa: SLF001
+            raise
+
+        self.header_table.resized = False
+        self.table_size_changes = []
 
         log.debug("Encoded header block to %s", encoded)
 
@@ -411,7 +419,6 @@ class Encoder:
             b = encode_integer(size_bytes, 5)
             b[0] |= 0x20
             block += bytes(b)
-        self.table_size_changes = []
         return block
 
 
