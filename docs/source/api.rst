@@ -26,3 +26,13 @@ This document provides the HPACK API.
 .. autoclass:: hpack.OversizedHeaderListError
 
 .. autoclass:: hpack.InvalidTableSizeError
+
+.. autoclass:: hpack.BlockTrace
+
+.. autoclass:: hpack.RepresentationTrace
+
+.. autoclass:: hpack.EntryOrigin
+
+.. autoclass:: hpack.Eviction
+
+.. autoclass:: hpack.TableClear

@@ -1,7 +1,7 @@
 # flake8: noqa
 from collections import deque
 import logging
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from .exceptions import InvalidTableIndex
 
@@ -112,6 +112,15 @@ class HeaderTable:
         self._current_size = 0
         self.resized = False
         self.dynamic_entries: deque[tuple[bytes, bytes]] = deque()
+        #: Opaque provenance data, kept parallel to ``dynamic_entries`` so
+        #: that a decoder can later resolve which entry a table index
+        #: referred to, even after the index has been reused. Entries added
+        #: without provenance simply store ``None``.
+        self.entry_origins: deque[Any] = deque()
+        #: Optional observers, invoked when entries are evicted from or the
+        #: whole dynamic table is cleared. Used to implement decode tracing.
+        self.eviction_observer: Optional[Callable[[bytes, bytes, Any], None]] = None
+        self.clear_observer: Optional[Callable[[str, int], None]] = None
 
     def get_by_index(self, index: int) -> tuple[bytes, bytes]:
         """
@@ -137,6 +146,17 @@ class HeaderTable:
 
         raise InvalidTableIndex("Invalid table index %d" % original_index)
 
+    def get_origin_by_index(self, index: int) -> Any:
+        """
+        Returns the provenance data for the dynamic table entry specified by
+        index, or ``None`` if the index refers to the static table or no
+        provenance data was recorded for the entry.
+        """
+        dynamic_index = index - HeaderTable.STATIC_TABLE_LENGTH - 1
+        if 0 <= dynamic_index < len(self.entry_origins):
+            return self.entry_origins[dynamic_index]
+        return None
+
     def __repr__(self) -> str:
         return "HeaderTable(%d, %s, %r)" % (
             self._maxsize,
@@ -154,11 +174,16 @@ class HeaderTable:
         # We just clear the table if the entry is too big
         size = table_entry_size(name, value)
         if size > self._maxsize:
+            discarded = len(self.dynamic_entries)
             self.dynamic_entries.clear()
+            self.entry_origins.clear()
             self._current_size = 0
+            if self.clear_observer is not None:
+                self.clear_observer("oversized_entry", discarded)
         else:
             # Add new entry
             self.dynamic_entries.appendleft((name, value))
+            self.entry_origins.appendleft(None)
             self._current_size += size
             self._shrink()
 
@@ -203,8 +228,12 @@ class HeaderTable:
         self._maxsize = newmax
         self.resized = (newmax != oldmax)
         if newmax <= 0:
+            discarded = len(self.dynamic_entries)
             self.dynamic_entries.clear()
+            self.entry_origins.clear()
             self._current_size = 0
+            if self.clear_observer is not None:
+                self.clear_observer("resize", discarded)
         elif oldmax > newmax:
             self._shrink()
 
@@ -215,8 +244,11 @@ class HeaderTable:
         cursize = self._current_size
         while cursize > self._maxsize:
             name, value = self.dynamic_entries.pop()
+            origin = self.entry_origins.pop()
             cursize -= table_entry_size(name, value)
             log.debug("Evicting %s: %s from the header table", name, value)
+            if self.eviction_observer is not None:
+                self.eviction_observer(name, value, origin)
         self._current_size = cursize
 
 

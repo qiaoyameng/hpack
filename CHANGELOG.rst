@@ -1,6 +1,22 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added optional decode tracing to ``Decoder``: pass ``trace=True`` to record
+  a structural ``BlockTrace`` per decoded header block in ``decoder.traces``.
+  Each representation records its byte range in the block, its kind, Huffman
+  usage and never-indexed flag; dynamic table references record the block and
+  field that created the entry, so reused numeric indices still resolve to
+  the correct generation. Table size changes, evictions and table clears are
+  recorded as well, and failed blocks keep the partial trace with
+  ``complete=False``. Traces are structural only and never contain header
+  values unless ``trace_values=True`` is passed; never-indexed fields never
+  have their values captured.
+
 4.2.0 (2026-06-22)
 ------------------
 
