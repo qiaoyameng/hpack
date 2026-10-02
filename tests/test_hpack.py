@@ -856,3 +856,173 @@ class TestDictToIterable:
 
         assert expected_special == received_special
         assert expected_boring == received_boring
+
+
+class TestIsolationDomainSwitching:
+    """
+    Tests for explicitly switching the HPACK compression isolation domain
+    on a connection shared by multiple tenants.
+    """
+    def _tenant_headers(self, tenant, secret):
+        return [
+            HeaderTuple(':method', 'GET'),
+            HeaderTuple('x-tenant-id', tenant),
+            HeaderTuple('x-api-key', secret),
+        ]
+
+    def test_switch_emits_legal_table_size_update_prefix(self):
+        """
+        Switching the isolation domain makes the next block start with a
+        shrink-to-zero update followed by a restore to the current size.
+        """
+        e = Encoder()
+        d = Decoder()
+
+        e.encode(self._tenant_headers('tenant-a', 'secret-a'), huffman=False)
+        e.switch_isolation_domain()
+        block = e.encode(self._tenant_headers('tenant-b', 'secret-b'),
+                         huffman=False)
+
+        # Shrink to zero (0x20), then restore to the default 4096.
+        assert block[:4] == b'\x20\x3f\xe1\x1f'
+        assert d.decode(block) == [HeaderTuple(*h) for h in
+                                   self._tenant_headers('tenant-b',
+                                                        'secret-b')]
+
+    def test_persistent_decoder_across_domain_sequence(self):
+        """
+        A single long-lived decoder receives A, A, B, A header blocks: it
+        must always decode, and cross-domain blocks must not use dynamic
+        indexes referring to the previous domain's secret values.
+        """
+        e = Encoder()
+        d = Decoder()
+
+        tenant_a = self._tenant_headers('tenant-a', 'a-secret-key')
+        tenant_b = self._tenant_headers('tenant-b', 'b-secret-key')
+
+        block_a1 = e.encode(tenant_a, huffman=False)
+        block_a2 = e.encode(tenant_a, huffman=False)
+        e.switch_isolation_domain()
+        block_b = e.encode(tenant_b, huffman=False)
+        e.switch_isolation_domain()
+        block_a3 = e.encode(tenant_a, huffman=False)
+
+        # Within one domain the compression benefits are preserved: the
+        # repeated block is shorter and fully indexes the secret value.
+        assert len(block_a2) < len(block_a1)
+        assert b'a-secret-key' not in block_a2
+
+        # Cross-domain blocks re-emit the secret literally: no dynamic
+        # index may point at an entry left behind by the previous domain.
+        assert b'b-secret-key' in block_b
+        assert b'a-secret-key' in block_a3
+
+        # The persistent decoder accepts the whole sequence.
+        assert d.decode(block_a1) == tenant_a
+        assert d.decode(block_a2) == tenant_a
+        assert d.decode(block_b) == tenant_b
+
+        # After decoding B's block, no trace of A's secret remains in the
+        # decoder's dynamic table.
+        assert all(b'a-secret-key' not in value
+                   for _, value in d.header_table.dynamic_entries)
+
+        assert d.decode(block_a3) == tenant_a
+
+    def test_consecutive_switches_without_encoding_coalesce(self):
+        """
+        Repeated switches before any encode call merge into a single
+        legal update prefix.
+        """
+        e = Encoder()
+        d = Decoder()
+
+        e.encode(self._tenant_headers('tenant-a', 'secret-a'), huffman=False)
+        e.switch_isolation_domain()
+        e.switch_isolation_domain()
+        e.switch_isolation_domain()
+        block = e.encode(self._tenant_headers('tenant-b', 'secret-b'),
+                         huffman=False)
+
+        # Exactly one shrink/restore pair, not one per switch call.
+        assert block[:4] == b'\x20\x3f\xe1\x1f'
+        assert block[4] != 0x20
+        assert d.decode(block) == self._tenant_headers('tenant-b',
+                                                       'secret-b')
+
+    def test_switch_merges_with_pending_table_size_changes(self):
+        """
+        Table size adjustments interleaved with a switch are merged into
+        a single legal prefix ending at the current negotiated size.
+        """
+        e = Encoder()
+        d = Decoder()
+
+        e.encode(self._tenant_headers('tenant-a', 'secret-a'), huffman=False)
+        e.header_table_size = 128
+        e.switch_isolation_domain()
+        e.header_table_size = 256
+        block = e.encode(self._tenant_headers('tenant-b', 'secret-b'),
+                         huffman=False)
+
+        # Shrink to zero, then restore straight to the newest size: the
+        # intermediate 128 update is subsumed by the reset.
+        assert block[:4] == b'\x20\x3f\xe1\x01'
+        assert d.decode(block) == self._tenant_headers('tenant-b',
+                                                       'secret-b')
+        assert d.header_table_size == 256
+
+    def test_restore_never_exceeds_negotiated_limit(self):
+        """
+        The restore update uses the currently negotiated table size, so a
+        reduced limit is never exceeded.
+        """
+        e = Encoder()
+        d = Decoder()
+        d.max_allowed_table_size = 512
+
+        e.header_table_size = 512
+        e.encode(self._tenant_headers('tenant-a', 'secret-a'), huffman=False)
+        e.switch_isolation_domain()
+        block = e.encode(self._tenant_headers('tenant-b', 'secret-b'),
+                         huffman=False)
+
+        # Shrink to zero, then restore to 512 (not the 4096 default).
+        assert block[:4] == b'\x20\x3f\xe1\x03'
+        assert d.decode(block) == self._tenant_headers('tenant-b',
+                                                       'secret-b')
+
+    def test_static_table_usable_after_switch(self):
+        """
+        Static table entries remain referenceable in the new domain.
+        """
+        e = Encoder()
+        d = Decoder()
+
+        e.encode(self._tenant_headers('tenant-a', 'secret-a'), huffman=False)
+        e.switch_isolation_domain()
+        block = e.encode([(':method', 'GET')], huffman=False)
+
+        # ':method: GET' is static index 2, encoded as 0x82.
+        assert block == b'\x20\x3f\xe1\x1f\x82'
+        assert d.decode(block) == [(':method', 'GET')]
+
+    def test_never_indexed_headers_stay_sensitive_after_switch(self):
+        """
+        Never-indexed headers keep their sensitive marker across a switch
+        and are never added to either peer's dynamic table.
+        """
+        e = Encoder()
+        d = Decoder()
+
+        headers = [NeverIndexedHeaderTuple('authorization', 'sensitive-info')]
+        e.encode(headers, huffman=False)
+        e.switch_isolation_domain()
+        block = e.encode(headers, huffman=False)
+
+        decoded = d.decode(block)
+        assert isinstance(decoded[0], NeverIndexedHeaderTuple)
+        assert not decoded[0].indexable
+        assert list(e.header_table.dynamic_entries) == []
+        assert list(d.header_table.dynamic_entries) == []

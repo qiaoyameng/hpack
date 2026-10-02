@@ -171,6 +171,7 @@ class Encoder:
             REQUEST_CODES, REQUEST_CODES_LENGTH,
         )
         self.table_size_changes: list[int] = []
+        self._isolation_reset_pending = False
 
     @property
     def header_table_size(self) -> int:
@@ -184,6 +185,31 @@ class Encoder:
         self.header_table.maxsize = value
         if self.header_table.resized:
             self.table_size_changes.append(value)
+
+    def switch_isolation_domain(self) -> None:
+        """
+        Begins a new HPACK compression isolation domain.
+
+        When a single HTTP/2 connection serves multiple tenants, dynamic
+        table entries written while encoding one tenant's headers must not
+        be referenced when encoding another tenant's headers. Calling this
+        method schedules a dynamic table flush: the next header block
+        emitted by :meth:`encode` will begin with a pair of dynamic table
+        size updates (shrink to zero, then restore to the current
+        negotiated size) that the peer's decoder applies before any header
+        field, guaranteeing that no dynamic index in the new domain can
+        refer to an entry added in a previous one.
+
+        The restored size never exceeds the currently configured
+        :attr:`header_table_size`, so it stays within the limit negotiated
+        with the peer. Consecutive calls before any call to :meth:`encode`
+        coalesce into a single flush, and any pending table size changes
+        are merged into the same legal update prefix. The static table and
+        never-indexed (sensitive) header handling are unaffected, and
+        headers encoded within one domain keep their normal compression
+        benefits.
+        """
+        self._isolation_reset_pending = True
 
     def encode(self,
                headers: Iterable[\
@@ -245,6 +271,10 @@ class Encoder:
 
         # Before we begin, if the header table size has been changed we need
         # to signal all changes since last emission appropriately.
+        if self._isolation_reset_pending:
+            header_block.append(self._encode_isolation_reset())
+            self._isolation_reset_pending = False
+
         if self.header_table.resized:
             header_block.append(self._encode_table_size_change())
             self.header_table.resized = False
@@ -412,6 +442,38 @@ class Encoder:
             b[0] |= 0x20
             block += bytes(b)
         self.table_size_changes = []
+        return block
+
+    def _encode_isolation_reset(self) -> bytes:
+        """
+        Produces the dynamic table size update prefix that opens a new
+        isolation domain: the table is shrunk to zero and then restored to
+        its current (negotiated) size. Pending table size changes are
+        merged into this prefix so the decoder always sees a legal
+        sequence of updates at the start of the block.
+        """
+        # The reset subsumes any outstanding table size changes: shrinking
+        # to zero satisfies a pending reduction, and the restore below
+        # signals the current (possibly newly negotiated) size.
+        self.table_size_changes = []
+
+        maxsize = self.header_table.maxsize
+
+        # Evict every dynamic entry locally so that no header from the
+        # previous domain can be referenced by index, then restore the
+        # configured size. The restore never exceeds the size currently
+        # negotiated with the peer.
+        self.header_table.maxsize = 0
+        self.header_table.maxsize = maxsize
+        self.header_table.resized = False
+
+        zero = encode_integer(0, 5)
+        zero[0] |= 0x20
+        block = bytes(zero)
+        if maxsize:
+            restore = encode_integer(maxsize, 5)
+            restore[0] |= 0x20
+            block += bytes(restore)
         return block
 
 

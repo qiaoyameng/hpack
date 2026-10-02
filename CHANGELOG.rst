@@ -1,6 +1,13 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added ``Encoder.switch_isolation_domain()``, which begins a new HPACK compression isolation domain. The next emitted header block starts with a dynamic table size update shrinking the table to zero followed by a restore to the current negotiated size, so tenants sharing one connection cannot reference each other's dynamic table entries.
+
 4.2.0 (2026-06-22)
 ------------------
 
