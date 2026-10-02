@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import HPACKDecodingError, InvalidTableSizeError, OversizedHeaderListError
+from .exceptions import HPACKDecodingError, HPACKError, InvalidTableSizeError, OversizedHeaderListError
 from .huffman import HuffmanEncoder
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from .huffman_table import decode_huffman
@@ -32,6 +32,15 @@ _PREFIX_BIT_MAX_NUMBERS = [(2 ** i) - 1 for i in range(9)]
 # We default the maximum header list we're willing to accept to 64kB. That's a
 # lot of headers, but if applications want to raise it they can do.
 DEFAULT_MAX_HEADER_LIST_SIZE = 2 ** 16
+
+
+class _IncompleteField(Exception):
+    """
+    Internal signal raised by the field parsers when the buffer does not yet
+    contain a complete header field representation. This is never a decoding
+    error by itself: it only becomes one (a truncation error) if the peer
+    explicitly ends the header block while bytes are still missing.
+    """
 
 
 def _unicode_if_needed(header: HeaderWeaklyTyped, raw: bool) -> HeaderTuple:
@@ -85,6 +94,24 @@ def decode_integer(data: bytes | memoryview, prefix_bits: int) -> tuple[int, int
     number of bytes that were consumed from ``data`` in order to get that
     integer.
     """
+    try:
+        return _decode_integer_partial(data, prefix_bits)
+    except _IncompleteField as err:
+        msg = f"Unable to decode HPACK integer representation from {data!r}"
+        raise HPACKDecodingError(msg) from err
+
+
+def _decode_integer_partial(data: bytes | memoryview, prefix_bits: int) -> tuple[int, int]:
+    """
+    Decodes an integer according to the wacky integer encoding rules
+    defined in the HPACK spec. Returns a tuple of the decoded integer and the
+    number of bytes that were consumed from ``data`` in order to get that
+    integer.
+
+    Unlike :func:`decode_integer`, running out of input raises
+    :class:`_IncompleteField` instead of :class:`HPACKDecodingError`, which
+    allows incremental decoding to simply wait for more bytes.
+    """
     if prefix_bits < 1 or prefix_bits > 8:
         msg = f"Prefix bits must be between 1 and 8, got {prefix_bits}"
         raise ValueError(msg)
@@ -118,10 +145,8 @@ def decode_integer(data: bytes | memoryview, prefix_bits: int) -> tuple[int, int
                     #   > value or octet length -- MUST be treated as decoding errors.
                     msg = f"Variable integer representation is too long: {data!r}"
                     raise HPACKDecodingError(msg)
-
     except IndexError as err:
-        msg = f"Unable to decode HPACK integer representation from {data!r}"
-        raise HPACKDecodingError(msg) from err
+        raise _IncompleteField from err
 
     log.debug("Decoded %d, consumed %d bytes", number, index)
 
@@ -419,6 +444,20 @@ class Decoder:
     """
     An HPACK decoder object.
 
+    .. versionchanged:: 4.3.0
+       Added incremental decoding via :meth:`start_header_block`,
+       :meth:`feed` and :meth:`end_header_block`, allowing a single header
+       block to be decoded as its bytes arrive (for example across HTTP/2
+       HEADERS and CONTINUATION frames) without the caller assembling the
+       complete block first.
+
+       Failure contract: once any decoding operation raises an
+       ``HPACKError``, the decoder is permanently failed. Every subsequent
+       decoding operation (including :meth:`decode`) raises
+       ``HPACKDecodingError``. The compression state can no longer be
+       trusted, so the connection should be torn down and the decoder
+       discarded; create a new ``Decoder`` to decode again.
+
     .. versionchanged:: 2.3.0
        Added ``max_header_list_size`` argument.
 
@@ -465,6 +504,15 @@ class Decoder:
         #: to confirm that it fits in this size.
         self.max_allowed_table_size = self.header_table.maxsize
 
+        # State for incremental decoding, see start_header_block/feed/
+        # end_header_block. ``_failed`` records the permanent failure state
+        # described in the class docstring.
+        self._failed = False
+        self._in_header_block = False
+        self._block_buffer = b""
+        self._block_headers: list[HeaderTuple] = []
+        self._block_inflated_size = 0
+
     @property
     def header_table_size(self) -> int:
         """
@@ -480,6 +528,11 @@ class Decoder:
         """
         Takes an HPACK-encoded header block and decodes it into a header set.
 
+        This is a one-shot convenience API: the entire header block must be
+        present in ``data``. To decode a header block that arrives in
+        fragments, use :meth:`start_header_block`, :meth:`feed` and
+        :meth:`end_header_block` instead.
+
         :param data: A bytestring representing a complete HPACK-encoded header
                      block.
         :param raw: (optional) Whether to return the headers as tuples of raw
@@ -491,6 +544,11 @@ class Decoder:
         :raises HPACKDecodingError: If an error is encountered while decoding
                                     the header block.
         """
+        self._assert_usable()
+        if self._in_header_block:
+            msg = "decode() cannot be called while an incremental header block is in progress"
+            raise HPACKDecodingError(msg)
+
         log.debug("Decoding %s", data)
 
         data_mem = memoryview(data)
@@ -500,43 +558,13 @@ class Decoder:
         current_index = 0
 
         while current_index < data_len:
-            # Work out what kind of header we're decoding.
-            # If the high bit is 1, it's an indexed field.
-            current = data[current_index]
-            indexed = bool(current & 0x80)
-
-            # Otherwise, if the second-highest bit is 1 it's a field that does
-            # alter the header table.
-            literal_index = bool(current & 0x40)
-
-            # Otherwise, if the third-highest bit is 1 it's an encoding context
-            # update.
-            encoding_update = bool(current & 0x20)
-
-            if indexed:
-                header, consumed = self._decode_indexed(
-                    data_mem[current_index:],
+            try:
+                header, consumed = self._parse_field(
+                    data_mem[current_index:], bool(headers),
                 )
-            elif literal_index:
-                # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal_index(
-                    data_mem[current_index:],
-                )
-            elif encoding_update:
-                # It's an update to the encoding context. These are forbidden
-                # in a header block after any actual header.
-                if headers:
-                    msg = "Table size update not at the start of the block"
-                    raise HPACKDecodingError(msg)
-                consumed = self._update_encoding_context(
-                    data_mem[current_index:],
-                )
-                header = None
-            else:
-                # It's a literal header that does not affect the header table.
-                header, consumed = self._decode_literal_no_index(
-                    data_mem[current_index:],
-                )
+            except _IncompleteField as err:
+                msg = "Truncated header block"
+                raise HPACKDecodingError(msg) from err
 
             if header:
                 headers.append(header)
@@ -559,6 +587,224 @@ class Decoder:
             msg = "Unable to decode headers as UTF-8"
             raise HPACKDecodingError(msg) from err
 
+    def start_header_block(self) -> None:
+        """
+        Begins incremental decoding of a new header block.
+
+        After calling this method, feed the fragments of the header block to
+        :meth:`feed` as they arrive, and call :meth:`end_header_block` once
+        the final fragment has been fed. Only one header block may be in
+        progress at a time, and :meth:`decode` may not be used until the
+        block is ended.
+
+        .. versionadded:: 4.3.0
+
+        :raises HPACKDecodingError: If a header block is already in progress,
+                                    or the decoder is in a failed state.
+        """
+        self._assert_usable()
+        if self._in_header_block:
+            msg = "A header block is already in progress"
+            raise HPACKDecodingError(msg)
+        self._in_header_block = True
+        self._block_buffer = b""
+        self._block_headers = []
+        self._block_inflated_size = 0
+
+    def feed(self, data: bytes) -> list[HeaderTuple]:
+        """
+        Feeds a fragment of the current header block to the decoder.
+
+        Fragments may be split at any byte boundary: variable-length
+        integers, string lengths, Huffman-coded strings and dynamic table
+        size updates may all span fragments. Running out of bytes in the
+        middle of a header field representation is not an error; the decoder
+        simply waits for more data. Empty fragments are allowed and decode
+        nothing.
+
+        Each header field is decoded exactly once, as soon as all of its
+        bytes have been received, so a header is never added to the dynamic
+        table twice no matter how the block is fragmented.
+
+        .. versionadded:: 4.3.0
+
+        :param data: A bytes-like object containing the next fragment of the
+                     header block. May be empty.
+        :returns: A list of the headers that were completed by this
+                  fragment, in decoding order, as raw (byte-string)
+                  :class:`HeaderTuple <hpack.HeaderTuple>` objects. The
+                  complete header list for the block, optionally decoded as
+                  UTF-8, is returned by :meth:`end_header_block`.
+        :raises HPACKDecodingError: If no header block is in progress, the
+                                    decoder is in a failed state, or the
+                                    fragment contains invalid data. In the
+                                    latter case the decoder enters the failed
+                                    state and cannot be used again.
+        :raises OversizedHeaderListError: If the cumulative decoded size of
+                                          the header list exceeds
+                                          ``max_header_list_size``. The
+                                          decoder enters the failed state.
+        """
+        self._assert_usable()
+        if not self._in_header_block:
+            msg = "feed() called without a matching start_header_block()"
+            raise HPACKDecodingError(msg)
+
+        self._block_buffer += bytes(data)
+        new_headers: list[HeaderTuple] = []
+
+        try:
+            data_mem = memoryview(self._block_buffer)
+            consumed_total = 0
+            while consumed_total < len(data_mem):
+                try:
+                    header, consumed = self._parse_field(
+                        data_mem[consumed_total:], bool(self._block_headers),
+                    )
+                except _IncompleteField:
+                    # The remaining bytes are an incomplete header field
+                    # representation. Keep them buffered and wait for more.
+                    break
+                consumed_total += consumed
+                if header is not None:
+                    self._block_headers.append(header)
+                    new_headers.append(header)
+                    self._block_inflated_size += table_entry_size(
+                        header[0], header[1],
+                    )
+                    if self._block_inflated_size > self.max_header_list_size:
+                        msg = (
+                            f"A header list larger than "
+                            f"{self.max_header_list_size} has been received"
+                        )
+                        raise OversizedHeaderListError(msg)
+            self._block_buffer = self._block_buffer[consumed_total:]
+        except HPACKError:
+            self._abort_header_block()
+            raise
+
+        return new_headers
+
+    def end_header_block(self, raw: bool = False) -> Iterable[HeaderTuple]:
+        """
+        Ends the current incremental header block and returns its headers.
+
+        If any bytes of an incomplete header field representation remain
+        buffered at this point, the header block is truncated and an
+        :class:`HPACKDecodingError <hpack.HPACKDecodingError>` is raised.
+
+        .. versionadded:: 4.3.0
+
+        :param raw: (optional) Whether to return the headers as tuples of raw
+                    byte strings or to decode them as UTF-8 before returning
+                    them. The default value is False, which returns tuples of
+                    Unicode strings.
+        :returns: The complete list of decoded headers for the block, in
+                  decoding order.
+        :raises HPACKDecodingError: If no header block is in progress, the
+                                    decoder is in a failed state, or the
+                                    block is truncated or otherwise invalid.
+                                    In the latter cases the decoder enters
+                                    the failed state and cannot be used
+                                    again.
+        """
+        self._assert_usable()
+        if not self._in_header_block:
+            msg = "end_header_block() called without a matching start_header_block()"
+            raise HPACKDecodingError(msg)
+
+        try:
+            if self._block_buffer:
+                msg = (
+                    f"Truncated header block: {len(self._block_buffer)} "
+                    f"byte(s) of an incomplete header field remain"
+                )
+                raise HPACKDecodingError(msg)
+
+            # Confirm that the table size is lower than the maximum, exactly
+            # as decode() does at the end of a one-shot decode.
+            self._assert_valid_table_size()
+
+            try:
+                headers = [
+                    _unicode_if_needed(h, raw) for h in self._block_headers
+                ]
+            except UnicodeDecodeError as err:
+                msg = "Unable to decode headers as UTF-8"
+                raise HPACKDecodingError(msg) from err
+        except HPACKError:
+            self._abort_header_block()
+            raise
+
+        self._in_header_block = False
+        self._block_buffer = b""
+        self._block_headers = []
+        self._block_inflated_size = 0
+        return headers
+
+    def _assert_usable(self) -> None:
+        """
+        Enforces the failure contract: a failed decoder may not be reused.
+        """
+        if self._failed:
+            msg = (
+                "Decoder is in a failed state after a previous decoding "
+                "error and cannot be reused; create a new Decoder"
+            )
+            raise HPACKDecodingError(msg)
+
+    def _abort_header_block(self) -> None:
+        """
+        Abandons the in-progress header block after a decoding error and
+        puts the decoder into the permanent failed state.
+        """
+        self._failed = True
+        self._in_header_block = False
+        self._block_buffer = b""
+        self._block_headers = []
+        self._block_inflated_size = 0
+
+    def _parse_field(self, data: bytes | memoryview, has_headers: bool) -> tuple[HeaderTuple | None, int]:
+        """
+        Parses a single header field representation from the start of
+        ``data``. Returns a tuple of the decoded header (or ``None`` for a
+        dynamic table size update) and the number of bytes consumed.
+
+        Raises :class:`_IncompleteField` if ``data`` does not yet contain a
+        complete representation. In that case the decoder state (including
+        the dynamic table) is left untouched, so the same bytes can simply
+        be parsed again once more data arrives.
+        """
+        # Work out what kind of header we're decoding.
+        # If the high bit is 1, it's an indexed field.
+        current = data[0]
+        indexed = bool(current & 0x80)
+
+        # Otherwise, if the second-highest bit is 1 it's a field that does
+        # alter the header table.
+        literal_index = bool(current & 0x40)
+
+        # Otherwise, if the third-highest bit is 1 it's an encoding context
+        # update.
+        encoding_update = bool(current & 0x20)
+
+        if indexed:
+            return self._decode_indexed_partial(data)
+        elif literal_index:
+            # It's a literal header that does affect the header table.
+            return self._decode_literal_partial(data, should_index=True)
+        elif encoding_update:
+            # It's an update to the encoding context. These are forbidden
+            # in a header block after any actual header.
+            if has_headers:
+                msg = "Table size update not at the start of the block"
+                raise HPACKDecodingError(msg)
+            consumed = self._update_encoding_context_partial(data)
+            return None, consumed
+        else:
+            # It's a literal header that does not affect the header table.
+            return self._decode_literal_partial(data, should_index=False)
+
     def _assert_valid_table_size(self) -> None:
         """
         Check that the table size set by the encoder is lower than the maximum
@@ -572,8 +818,21 @@ class Decoder:
         """
         Handles a byte that updates the encoding context.
         """
+        try:
+            return self._update_encoding_context_partial(data)
+        except _IncompleteField as err:
+            msg = "Truncated header block"
+            raise HPACKDecodingError(msg) from err
+
+    def _update_encoding_context_partial(self, data: bytes | memoryview) -> int:
+        """
+        Handles a byte that updates the encoding context.
+
+        Raises :class:`_IncompleteField` if the size update integer is not
+        yet complete.
+        """
         # We've been asked to resize the header table.
-        new_size, consumed = decode_integer(data, 5)
+        new_size, consumed = _decode_integer_partial(data, 5)
         if new_size > self.max_allowed_table_size:
             msg = "Encoder exceeded max allowable table size"
             raise InvalidTableSizeError(msg)
@@ -584,7 +843,20 @@ class Decoder:
         """
         Decodes a header represented using the indexed representation.
         """
-        index, consumed = decode_integer(data, 7)
+        try:
+            return self._decode_indexed_partial(data)
+        except _IncompleteField as err:
+            msg = "Truncated header block"
+            raise HPACKDecodingError(msg) from err
+
+    def _decode_indexed_partial(self, data: bytes | memoryview) -> tuple[HeaderTuple, int]:
+        """
+        Decodes a header represented using the indexed representation.
+
+        Raises :class:`_IncompleteField` if the index integer is not yet
+        complete.
+        """
+        index, consumed = _decode_integer_partial(data, 7)
         header = HeaderTuple(*self.header_table.get_by_index(index))
         log.debug("Decoded %s, consumed %d", header, consumed)
         return header, consumed
@@ -599,9 +871,21 @@ class Decoder:
         """
         Decodes a header represented with a literal.
         """
-        if isinstance(data, memoryview):
-            data = data.tobytes()  # pragma: no cover
+        try:
+            return self._decode_literal_partial(data, should_index)
+        except _IncompleteField as err:
+            msg = "Truncated header block"
+            raise HPACKDecodingError(msg) from err
 
+    def _decode_literal_partial(self, data: bytes | memoryview, should_index: bool) -> tuple[HeaderTuple, int]:
+        """
+        Decodes a header represented with a literal.
+
+        Raises :class:`_IncompleteField` if ``data`` does not yet contain
+        the complete representation. The dynamic table is only updated once
+        the whole representation has been parsed, so an incomplete parse
+        never mutates decoder state.
+        """
         total_consumed = 0
 
         # When should_index is true, if the low six bits of the first byte are
@@ -620,7 +904,7 @@ class Decoder:
 
         if indexed_name:
             # Indexed header name.
-            index, consumed = decode_integer(data, name_len)
+            index, consumed = _decode_integer_partial(data, name_len)
             name = self.header_table.get_by_index(index)[0]
 
             total_consumed = consumed
@@ -630,11 +914,10 @@ class Decoder:
             # move forward.
             data = data[1:]
 
-            length, consumed = decode_integer(data, 7)
-            name = data[consumed:consumed + length]
-            if len(name) != length:
-                msg = "Truncated header block"
-                raise HPACKDecodingError(msg)
+            length, consumed = _decode_integer_partial(data, 7)
+            if len(data) - consumed < length:
+                raise _IncompleteField
+            name = bytes(data[consumed:consumed + length])
 
             if data[0] & 0x80:
                 name = decode_huffman(name)
@@ -643,11 +926,10 @@ class Decoder:
         data = data[consumed + length:]
 
         # The header value is definitely length-based.
-        length, consumed = decode_integer(data, 7)
-        value = data[consumed:consumed + length]
-        if len(value) != length:
-            msg = "Truncated header block"
-            raise HPACKDecodingError(msg)
+        length, consumed = _decode_integer_partial(data, 7)
+        if len(data) - consumed < length:
+            raise _IncompleteField
+        value = bytes(data[consumed:consumed + length])
 
         if data[0] & 0x80:
             value = decode_huffman(value)

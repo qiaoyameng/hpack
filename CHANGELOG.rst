@@ -1,6 +1,19 @@
 Release History
 ===============
 
+4.3.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added incremental decoding to ``Decoder`` via the new ``start_header_block``,
+  ``feed`` and ``end_header_block`` methods. A single HPACK header block can
+  now be decoded as its bytes arrive (for example across HTTP/2 HEADERS and
+  CONTINUATION frames) without the caller assembling the complete block first.
+  Fragments may be split at any byte boundary; once any decoding operation
+  fails, the decoder is permanently failed and all further decoding operations
+  raise ``HPACKDecodingError``.
+
 4.2.0 (2026-06-22)
 ------------------
 
